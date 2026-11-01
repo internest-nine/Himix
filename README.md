@@ -49,6 +49,7 @@ Himix 是一款面向 Windows 的开源多网卡聚合与分流工具，派生�
 - [技术边界](#技术边界)
 - [开发与构建](#开发与构建)
 - [开源协议](#开源协议)
+- [支持这个项目](#支持这个项目)
 
 ---
 
@@ -307,3 +308,24 @@ Himix 派生自 [HypoMux](https://github.com/Hypostasis-Cat/HypoMux)，遵循 **
 <p align="center">
   <a href="https://github.com/Hypostasis-Cat/HypoMux"><img src="https://img.shields.io/badge/upstream-HypoMux%20v2.8.2-0078D4?style=flat-square" alt="Upstream"></a>
 </p>
+
+---
+
+## 支持这个项目
+
+Himix 完全免费：没有付费版，没有功能阉割，也没有广告。装完就能用，不赞赏一样用。
+
+如果它确实帮你把带宽跑满了，或者省下了折腾分流规则的时间，可以扫下面的码请我喝杯咖啡。纯属自愿，量力而行就好。
+
+<table align="center">
+  <tr>
+    <th align="center">微信</th>
+    <th align="center">支付宝</th>
+  </tr>
+  <tr>
+    <td align="center"><img src="support/qr-wechat.png" width="220" alt="微信赞赏码"></td>
+    <td align="center"><img src="support/qr-alipay.png" width="220" alt="支付宝赞赏码"></td>
+  </tr>
+</table>
+
+> 只想反馈问题或提建议的话，直接开 [Issue](https://github.com/internest-nine/Himix/issues) 就行，比赞赏有用得多。

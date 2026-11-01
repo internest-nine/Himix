@@ -49,6 +49,7 @@ Grab either build from the [Releases](https://github.com/internest-nine/Himix/re
 - [Technical boundaries](#technical-boundaries)
 - [Building from source](#building-from-source)
 - [License](#license)
+- [Supporting this project](#supporting-this-project)
 
 ---
 
@@ -305,3 +306,24 @@ Upstream's sponsors, signing service and acknowledgements are listed in the upst
 <p align="center">
   <a href="https://github.com/Hypostasis-Cat/HypoMux"><img src="https://img.shields.io/badge/upstream-HypoMux%20v2.8.2-0078D4?style=flat-square" alt="Upstream"></a>
 </p>
+
+---
+
+## Supporting this project
+
+Himix is free — no paid tier, no feature locks, no ads. It works the same whether or not you ever contribute.
+
+If it did saturate your bandwidth, or saved you from hand-tuning routing rules, you can buy me a coffee with the codes below. Entirely optional.
+
+<table align="center">
+  <tr>
+    <th align="center">WeChat</th>
+    <th align="center">Alipay</th>
+  </tr>
+  <tr>
+    <td align="center"><img src="support/qr-wechat.png" width="220" alt="WeChat tip code"></td>
+    <td align="center"><img src="support/qr-alipay.png" width="220" alt="Alipay tip code"></td>
+  </tr>
+</table>
+
+> Both codes are for Chinese payment apps; they may need a mainland account. If you would rather help in a way that costs nothing, filing an [issue](https://github.com/internest-nine/Himix/issues) is far more useful.
