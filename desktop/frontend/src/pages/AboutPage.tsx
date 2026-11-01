@@ -219,8 +219,8 @@ export function AboutPage() {
           </p>
           <p>
             {text(
-              "如果你想支持这个项目，项目主页的「关于支持」一节里有说明。",
-              "If you would like to support this project, the \"On supporting this project\" section on the project page explains the options.",
+              "如果你想支持这份工作，请优先支持上游作者（Hypostasis-Cat）。本分支自己的说明见项目主页的「关于支持」一节。",
+              "If you would like to support this work, please support the upstream author (Hypostasis-Cat) first. This fork's own notes are in the \"On supporting this project\" section on the project page.",
             )}
           </p>
         </GlassSurface>
