@@ -25,8 +25,22 @@ See [Differences from HypoMux](#differences-from-hypomux) below.
 
 ---
 
+## Download
+
+Grab either build from the [Releases](https://github.com/internest-nine/Himix/releases) page — they are functionally identical:
+
+| File | Description |
+| --- | --- |
+| `Himix_Setup_0.1.exe` | **Installer (recommended).** Installs to `C:\Program Files\Himix`, registers the core service, creates shortcuts, uninstalls cleanly |
+| `Himix_0.1_portable.zip` | **Portable.** Unzip and run; writes no registry keys and registers no service. Full mode needs you to run it as administrator each time |
+
+> The installer is **not code-signed**, so Windows SmartScreen may warn about an unknown publisher. Verify against the SHA-256 listed on the release page.
+
+---
+
 ## Contents
 
+- [Download](#download)
 - [Differences from HypoMux](#differences-from-hypomux)
 - [New in this fork](#new-in-this-fork)
 - [Core features](#core-features)

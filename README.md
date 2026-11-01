@@ -25,8 +25,22 @@ Himix 是一款面向 Windows 的开源多网卡聚合与分流工具，派生�
 
 ---
 
+## 下载
+
+到 [Releases](https://github.com/internest-nine/Himix/releases) 页面下载，两种形态功能相同：
+
+| 文件 | 说明 |
+| --- | --- |
+| `Himix_Setup_0.1.exe` | **安装版（推荐）**。装到 `C:\Program Files\Himix`，自动注册核心服务、创建快捷方式，可完整卸载 |
+| `Himix_0.1_portable.zip` | **免安装版**。解压即用，不写注册表、不注册服务；「全接管」模式需每次以管理员身份运行 |
+
+> 安装包**未做代码签名**，Windows SmartScreen 可能提示未知发布者。请对照 Release 页给出的 SHA-256 校验。
+
+---
+
 ## 目录
 
+- [下载](#下载)
 - [与 HypoMux 的差异](#与-hypomux-的差异)
 - [新增功能](#新增功能)
 - [核心功能](#核心功能)
