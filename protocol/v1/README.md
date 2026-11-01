@@ -1,0 +1,118 @@
+# Himix engine protocol v1
+
+## Experimental adaptive scheduling
+
+`engine.hello.scheduling_strategies` advertises `round-robin`, `weighted`, and
+`adaptive-throughput`. This is a separate optional field; `capabilities` remains
+the RPC method list. Missing strategy support means legacy boolean scheduling only.
+
+Both `engine.start` and `engine.scheduling` accept optional `strategy`. If omitted,
+`weighted: true` means weighted and false means round-robin. An explicit strategy
+is authoritative; unknown values fail validation. Returned scheduling configuration
+includes the strategy and a normalized `weighted` flag for rollback. Clients must
+not send adaptive mode to a Core that does not advertise it.
+
+Adaptive TCP scheduling starts with uniform rotation, then slowly adjusts shares
+using sustained observations and sufficient natural connection arrivals. Half of
+the budget remains uniformly allocated across eligible adapters; share changes
+are bounded to five percentage points per five valid samples. Marked aggregate
+throughput drops trigger uniform rotation and a 30-second cooldown. The heuristic
+does not estimate physical capacity or establish causality of speed changes.
+
+`engine.telemetry.scheduling.strategy` retains the requested strategy;
+`effective_tcp_strategy` is `adaptive-throughput` only while adjusting shares,
+otherwise `round-robin`. States include `warming-up`, `insufficient-demand`,
+`balanced`, `adapting` and `throughput-guard`. Per-link `allocation_share` is a new-connection
+share, not a bandwidth guarantee. UDP remains round-robin and existing TCP
+connections are not migrated. Decision counters and observed rates remain available.
+
+See [design and implementation scope](../../docs/architecture/adaptive-scheduling-implementation.md).
+
+## Optional Steam CDN optimization
+
+`engine.start.steam_cdn_enabled` defaults to false in both `proxy` and
+`tun_tcp_pool` modes. `engine.telemetry.steam_cdn` reports the runtime state,
+verified per-adapter candidates, observed rates, replacements and dial fallbacks.
+
+Check `engine.hello.capabilities` for `steam_cdn.configure` before using it.
+Its optional `enabled` boolean changes the running pool; `reset: true` clears
+learning. Omit `enabled` and use `reset: false` for a read-only snapshot.
+Disabling cancels discovery and clears learning; existing streams continue.
+With no pool, it returns an inactive empty snapshot and does not start an engine.
+Preference persistence belongs to the desktop. DNS results additionally expose
+optional `addresses` while retaining the existing `address` field semantics.
+
+See [implementation plan and validation](../../docs/steam-cdn-optimization.md).
+
+This directory is the language-neutral contract shared by the Go engine and
+the production Wails desktop client.
+
+- `manifest.json` records the advertised methods, events, lifecycle states,
+  error codes, and operational semantics.
+- `fixtures/messages.json` contains canonical wire-message examples.
+
+The fixture `message` objects are complete JSONL payloads without the trailing
+newline. Fixture metadata such as `name`, `kind`, and `method` is not sent on
+the wire.
+
+Protocol v1 is additive. Existing fields keep their name, JSON type, and
+meaning for the lifetime of v1. New optional fields, methods, events, and
+error codes may be added. Removing a field, changing its type or meaning, or
+changing lifecycle ordering requires a newly negotiated protocol version.
+
+Timestamps are UTC RFC 3339 values. Durations are integer milliseconds and
+byte counters are non-negative integers. Clients must use `engine.hello`
+capabilities instead of assuming every v1 engine implements every method.
+
+`engine.hello.modes` currently advertises `proxy` and `tun_tcp_pool`. The
+latter is a named-channel local SOCKS pool. Clients must inspect the additive
+`engine.hello.mode_features` map before assuming a mode supports a particular
+transport. The current TUN pool reports `tcp_connect` and `udp_associate`.
+Both proxy modes report `ipv6_egress` when additive adapter fields
+`source_ipv6` and `ipv6_if_index` are supported. Live TUN activation remains
+gated on development orchestration. Both modes report `adaptive_health` when
+their schedulers share continuous adapter health, and ordinary `proxy` also
+reports `domain_quarantine`. TUN does not claim domain awareness because
+sing-box resolves its destinations before forwarding literal IP targets.
+
+`managed_tun_lifecycle` indicates the two-phase TUN transaction. Clients first
+prepare `tun_tcp_pool`, generate configuration from the returned endpoints,
+then call `tun.activate`. The host validates configuration before network
+mutation, owns the exact sing-box process tree, and guarantees that
+`engine.stop` deactivates TUN before stopping the pool. `tun.status` is
+read-only and `tun.deactivate` is safe to retry.
+
+For a privileged Core, `tun.activate.executable` is only a compatibility
+assertion: the Core launches the sing-box path pinned by installation policy
+and rejects any different path. The desktop also sends `config_sha256` and,
+when present, `ipv4_fallback_sha256`. The Core verifies those digests and
+stages the exact bytes under a SYSTEM/Administrators-only directory before
+sing-box reads them. Installed service policy failures use the additive
+`security_policy_rejected` error code.
+
+`dns.resolve` and `dns.status` are available while either `proxy` or
+`tun_tcp_pool` is running. In TUN mode they are the authoritative
+selected-adapter DNS preflight used to build the sing-box upstream plan; the
+channel listeners still accept only already-resolved IP destinations.
+
+The additive `engine.start.dns.dot_servers` field accepts up to 16
+`tls://hostname[:port]` URLs. Policy `dot` requires at least one URL and uses
+certificate-verified DNS over TLS, defaulting to port 853, without plaintext
+fallback or compatibility restarts. Resolver-hostname bootstrap uses
+source-bound traditional DNS; NAT64 discovery retains network DNS.
+`dns.status` adds `dot_endpoints`,
+`dot_successes`, and `dot_failures`; successful `dns.resolve` results report
+transport `dot` and `server` as `hostname@IP:port` (IPv6 IPs are bracketed).
+
+### Live aggregation scheduling
+
+`engine.scheduling` accepts `{weighted: boolean, adapters: Adapter[]}` while the
+engine is running. The complete pool must contain 1–64 distinct valid adapters,
+each with a weight of 1–100. The result is the previous scheduling configuration,
+which the desktop can submit to roll back a failed settings save. Retrying sets
+the same pool but returns the configuration immediately preceding that attempt.
+Listeners, TUN, established TCP connections and UDP flows are retained. New
+aggregation flows use the new pool; explicit NIC channels retain their bindings.
+A NIC can join the pool even if it was not selected at startup. This does not
+create new explicit NIC routing channels or change the TUN IPv6/DNS topology.
+Clients must check the `engine.scheduling` capability before live updates.

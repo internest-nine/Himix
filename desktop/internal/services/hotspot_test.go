@@ -1,0 +1,405 @@
+package services
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestHotspotStatusLoggingIsDeduplicatedAndPrivate(t *testing.T) {
+	logs := newSupportLogStore(filepath.Join(t.TempDir(), "app.log"))
+	logs.Start("tun", []string{"test"}, nil)
+	record := newHotspotStatusLogger(logs)
+	status := HotspotStatus{State: "running", SSID: "private-ssid", Band: "auto", ConfiguredBand: "5",
+		Clients: 1, TransmitLinkMbps: 866, SharingVerified: true,
+		Devices: []HotspotDevice{{MAC: "private-mac", Hosts: []string{"private-host"}}}, Diagnostics: "private-detail"}
+	record(status)
+	status.UpdatedAt = "later"
+	record(status)
+	status.TransmitLinkMbps = 433
+	record(status)
+	status.State = "stopped"
+	record(status)
+	raw, err := logs.Raw()
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	if strings.Count(text, `"event":"status_changed"`) != 3 || !strings.Contains(text, `"transmit_link_mbps":433`) {
+		t.Fatalf("missing or duplicated hotspot events: %s", text)
+	}
+	if strings.Contains(text, "private-") {
+		t.Fatal("hotspot identity leaked into support log")
+	}
+}
+
+func TestHotspotConfigValidation(t *testing.T) {
+	valid := HotspotConfig{SSID: "Himix 手机", Password: "safe-'$`password", Band: "auto"}
+	if err := validateHotspotConfig(valid); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name   string
+		config HotspotConfig
+	}{
+		{"blank", HotspotConfig{SSID: "  ", Password: valid.Password, Band: "auto"}},
+		{"ssid_bytes", HotspotConfig{SSID: strings.Repeat("网", 11), Password: valid.Password, Band: "auto"}},
+		{"ssid_newline", HotspotConfig{SSID: "a\nb", Password: valid.Password, Band: "auto"}},
+		{"short_password", HotspotConfig{SSID: "a", Password: "1234567", Band: "auto"}},
+		{"unicode_password", HotspotConfig{SSID: "a", Password: "密码12345678", Band: "auto"}},
+		{"band", HotspotConfig{SSID: "a", Password: valid.Password, Band: "6"}},
+		{"adapter_name", HotspotConfig{SSID: "a", Password: valid.Password, Band: "auto", AdapterID: "Wi-Fi"}},
+		{"adapter_script", HotspotConfig{SSID: "a", Password: valid.Password, Band: "auto", AdapterID: "'; throw 'bad"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if validateHotspotConfig(test.config) == nil {
+				t.Fatal("invalid configuration accepted")
+			}
+		})
+	}
+	for _, id := range []string{"00000000-0000-0000-0000-000000000001", "{00000000-0000-0000-0000-000000000001}"} {
+		config := valid
+		config.AdapterID = id
+		if err := validateHotspotConfig(config); err != nil {
+			t.Fatal("valid hotspot adapter rejected", err)
+		}
+	}
+}
+
+func TestHotspotRetryRechecksLivePrerequisitesAfterFailedCleanup(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+	s := &EngineService{lifecycleGate: make(chan struct{}, 1), hotspot: &hotspotSession{
+		done: done, status: HotspotStatus{State: "failed", CleanupComplete: false, Message: "old cleanup error"},
+	}}
+	_, err := s.StartHotspot(HotspotConfig{SSID: "Himix", Password: "password123", Band: "auto"})
+	if err == nil || !strings.Contains(err.Error(), "TUN 模式") {
+		t.Fatalf("retry should reach live prerequisites, got %v", err)
+	}
+}
+
+// Exercise the real subprocess/pipe lifecycle without changing host networking.
+func TestHotspotWorkerProcess(t *testing.T) {
+	mode := os.Getenv("HIMIX_HOTSPOT_TEST_WORKER")
+	if mode == "" {
+		return
+	}
+	input := bufio.NewReader(os.Stdin)
+	line, _ := input.ReadBytes('\n')
+	var config HotspotConfig
+	if json.Unmarshal(line, &config) != nil || config.Password != "safe-'$`password" {
+		os.Exit(2)
+	}
+	encoder := json.NewEncoder(os.Stdout)
+	if mode == "inspect" {
+		_ = encoder.Encode(map[string]string{"kind": "inspect_sharing"})
+		line, _ := input.ReadBytes('\n')
+		var reply hotspotSharingReply
+		if json.Unmarshal(line, &reply) != nil || reply.Error != "" || len(reply.Connections) != 2 || reply.Connections[0].Name != "Himix-Tun" {
+			os.Exit(4)
+		}
+	}
+	if mode == "reject" {
+		_ = encoder.Encode(HotspotStatus{State: "failed", Message: "Shared egress mismatch; rolled back", CleanupComplete: true})
+		os.Exit(0)
+	}
+	if mode == "unverified" {
+		_ = encoder.Encode(HotspotStatus{State: "running", SharingVerified: false})
+	} else if mode == "windows-managed" {
+		_ = encoder.Encode(HotspotStatus{State: "running", SharingVerified: false, GatewayAddress: "192.168.137.1", Message: "Egress unverified"})
+	} else {
+		_ = encoder.Encode(HotspotStatus{State: "running", SSID: config.SSID, SharingVerified: true})
+	}
+	if mode == "crash" {
+		os.Exit(3)
+	}
+	_, _ = io.Copy(io.Discard, input)
+	if mode == "stop-error" {
+		_ = encoder.Encode(HotspotStatus{State: "failed", Message: "Desktop disconnected during sharing inspection", CleanupComplete: true})
+		os.Exit(0)
+	}
+	if mode == "cleanup-failure" || mode == "restore-failure" {
+		off, restored := mode == "restore-failure", false
+		_ = encoder.Encode(HotspotStatus{State: "failed", Message: "Cleanup failed", CleanupComplete: false, HotspotOffConfirmed: &off, ConfigurationRestored: &restored, CleanupError: "cleanup details"})
+		os.Exit(0)
+	}
+	_ = encoder.Encode(HotspotStatus{State: "stopped", CleanupComplete: true})
+	os.Exit(0)
+}
+
+func launchTestHotspot(t *testing.T, mode string, timeout time.Duration) (*hotspotSession, error) {
+	t.Helper()
+	command := exec.Command(os.Args[0], "-test.run=^TestHotspotWorkerProcess$")
+	command.Env = append(os.Environ(), "HIMIX_HOTSPOT_TEST_WORKER="+mode)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return launchHotspot(ctx, command, HotspotConfig{SSID: "Himix 手机", Password: "safe-'$`password", Band: "auto"}, func() hotspotSharingReply {
+		return hotspotSharingReply{Connections: []hotspotSharingConnection{{Name: "Himix-Tun", Role: 0}, {Name: "Wi-Fi Direct", Role: 1}}}
+	})
+}
+
+func TestHotspotWorkerBrokersSharingInspection(t *testing.T) {
+	h, err := launchTestHotspot(t, "inspect", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := h.stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHotspotWorkerStopsOnPipeClose(t *testing.T) {
+	h, err := launchTestHotspot(t, "normal", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !h.snapshot().SharingVerified || h.snapshot().SSID != "Himix 手机" {
+		t.Fatal(h.snapshot())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := h.stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.stop(ctx); err != nil {
+		t.Fatal("stop must be idempotent", err)
+	}
+	if h.snapshot().State != "stopped" || h.snapshot().SharingVerified {
+		t.Fatal(h.snapshot())
+	}
+}
+
+func TestHotspotSessionConfigIsBoundToActiveSession(t *testing.T) {
+	config := HotspotConfig{SSID: "live", Password: "session-secret", Band: "auto"}
+	h := &hotspotSession{id: "session-a", config: config, status: HotspotStatus{State: "running", SSID: config.SSID}}
+	s := &EngineService{hotspot: h}
+	if status := s.HotspotStatus(); status.SessionID != "session-a" {
+		t.Fatal("missing session identity", status)
+	}
+	got, err := s.HotspotSessionConfig("session-a")
+	if err != nil || got != config {
+		t.Fatal("wrong active credentials", got, err)
+	}
+	// AI summaries were removed with the AI subsystem; the live status is now the
+	// only payload that could leak session credentials.
+	for _, value := range []any{s.HotspotStatus()} {
+		data, err := json.Marshal(value)
+		if err != nil || strings.Contains(string(data), config.Password) || strings.Contains(string(data), "password") {
+			t.Fatal("session credentials leaked into status")
+		}
+	}
+	for _, id := range []string{"", "session-b"} {
+		if got, err := s.HotspotSessionConfig(id); err == nil || got.Password != "" {
+			t.Fatal("exposed credentials for a different session")
+		}
+	}
+	for _, state := range []string{"starting", "stopping", "stopped", "failed"} {
+		h.status.State = state
+		if got, err := s.HotspotSessionConfig("session-a"); err == nil || got.Password != "" {
+			t.Fatal("exposed inactive credentials", state)
+		}
+	}
+	s.hotspot = &hotspotSession{id: "session-b", config: config, status: HotspotStatus{State: "running"}}
+	if _, err := s.HotspotSessionConfig("session-a"); err == nil {
+		t.Fatal("old session accepted after replacement")
+	}
+	s.hotspot = nil
+	if _, err := s.HotspotSessionConfig("session-b"); err == nil {
+		t.Fatal("missing session accepted")
+	}
+}
+
+func TestHotspotExpectedShutdownDoesNotHideCleanupFailure(t *testing.T) {
+	for _, mode := range []string{"stop-error", "cleanup-failure", "restore-failure"} {
+		t.Run(mode, func(t *testing.T) {
+			h, err := launchTestHotspot(t, mode, 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err = h.stop(ctx)
+			status := h.snapshot()
+			if mode == "stop-error" {
+				if err != nil || status.State != "stopped" || status.Message != "" {
+					t.Fatal("expected shutdown reported as failure", status, err)
+				}
+			} else if err == nil || status.State != "failed" || status.CleanupComplete {
+				t.Fatal("real cleanup failure was hidden", status, err)
+			}
+			if mode != "stop-error" && (status.HotspotOffConfirmed == nil || *status.HotspotOffConfirmed != (mode == "restore-failure") || status.ConfigurationRestored == nil || *status.ConfigurationRestored || status.CleanupError != "cleanup details") {
+				t.Fatal("cleanup details lost", status)
+			}
+		})
+	}
+}
+
+func TestHotspotRepeatedStartStopSessions(t *testing.T) {
+	for range 5 {
+		h, err := launchTestHotspot(t, "normal", 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err = h.stop(ctx)
+		cancel()
+		if err != nil || h.snapshot().State != "stopped" {
+			t.Fatal("session did not cleanly stop", err)
+		}
+	}
+}
+
+func TestHotspotWorkerRejectsWrongSharedEgress(t *testing.T) {
+	h, err := launchTestHotspot(t, "reject", 5*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "egress mismatch") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if h.snapshot().State != "failed" {
+		t.Fatal(h.snapshot())
+	}
+	if err := h.stop(context.Background()); err != nil {
+		t.Fatal("a rolled-back start failure must not poison engine shutdown", err)
+	}
+	s := &EngineService{lifecycleGate: make(chan struct{}, 1), hotspot: h}
+	status, err := s.StopHotspot()
+	if err != nil || status.State != "stopped" || status.Message != "" {
+		t.Fatal("successful explicit stop retained stale failure", err, status)
+	}
+}
+
+func TestHotspotPublishesStartingSessionBeforeReadiness(t *testing.T) {
+	command := exec.Command(os.Args[0], "-test.run=^TestHotspotWorkerProcess$")
+	command.Env = append(os.Environ(), "HIMIX_HOTSPOT_TEST_WORKER=normal")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	observed := false
+	h, err := launchHotspotObserved(ctx, command, HotspotConfig{SSID: "test", Password: "safe-'$`password", Band: "auto"}, func(h *hotspotSession) {
+		observed = h.snapshot().State == "starting"
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.stop(ctx)
+	if !observed {
+		t.Fatal("starting session unavailable during launch")
+	}
+}
+
+func TestHotspotWorkerDoesNotAcceptUnverifiedRunningState(t *testing.T) {
+	h, err := launchTestHotspot(t, "unverified", time.Second)
+	if err == nil {
+		t.Fatal("unverified sharing reported as successful")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := h.stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHotspotWorkerKeepsOperationalUnverifiedHotspot(t *testing.T) {
+	h, err := launchTestHotspot(t, "windows-managed", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := h.snapshot()
+	if status.State != "running" || status.SharingVerified || status.GatewayAddress != "192.168.137.1" || status.Message == "" {
+		t.Fatal(status)
+	}
+	select {
+	case <-h.done:
+		t.Fatal("unobserved legacy sharing must not stop an operational hotspot")
+	default:
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := h.stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHotspotWorkerCrashClearsVerifiedState(t *testing.T) {
+	h, _ := launchTestHotspot(t, "crash", 5*time.Second)
+	select {
+	case <-h.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not exit")
+	}
+	status := h.snapshot()
+	if status.State != "failed" || status.SharingVerified || status.Message == "" {
+		t.Fatal(status)
+	}
+}
+
+func TestHotspotStartCancelRollsBackPendingWorker(t *testing.T) {
+	command := exec.Command(os.Args[0], "-test.run=^TestHotspotWorkerProcess$")
+	command.Env = append(os.Environ(), "HIMIX_HOTSPOT_TEST_WORKER=unverified")
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(300*time.Millisecond, cancel)
+	h, err := launchHotspot(ctx, command, HotspotConfig{SSID: "test", Password: "safe-'$`password", Band: "auto"})
+	if !errors.Is(err, errHotspotStartCanceled) {
+		t.Fatalf("cancel reported as %v", err)
+	}
+	select {
+	case <-h.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("canceled worker did not exit")
+	}
+	if status := h.snapshot(); status.State != "stopped" || status.SharingVerified {
+		t.Fatal(status)
+	}
+}
+
+func TestHotspotStopCancelsStartWaitingForLifecycle(t *testing.T) {
+	s := &EngineService{lifecycleGate: make(chan struct{}, 1)}
+	s.lifecycleGate <- struct{}{}
+	result := make(chan error, 1)
+	go func() {
+		_, err := s.StartHotspot(HotspotConfig{SSID: "Himix", Password: "password123", Band: "auto"})
+		result <- err
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s.mu.Lock()
+		registered := s.hotspotStart != nil
+		s.mu.Unlock()
+		if registered {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("start was not registered for cancellation")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	s.cancelHotspotStart()
+	select {
+	case err := <-result:
+		if !errors.Is(err, errHotspotStartCanceled) {
+			t.Fatalf("cancel reported as %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stop did not cancel a start blocked on the lifecycle gate")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.hotspotStart != nil {
+		t.Fatal("finished start remained cancelable")
+	}
+}
+
+func TestHotspotSystemOffIsLogged(t *testing.T) {
+	fields := hotspotPerformanceFields(HotspotStatus{State: "stopped", StopReason: "windows_off", IdleTimeout: "disabled"})
+	if fields["stop_reason"] != "windows_off" || fields["idle_timeout"] != "disabled" {
+		t.Fatal(fields)
+	}
+}

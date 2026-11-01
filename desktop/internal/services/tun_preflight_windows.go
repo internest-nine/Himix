@@ -1,0 +1,212 @@
+//go:build windows
+
+package services
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os/exec"
+	"strings"
+	"syscall"
+	"time"
+	"unsafe"
+
+	"github.com/internest-nine/Himix/desktop/internal/engineclient"
+	"golang.org/x/sys/windows"
+)
+
+const tunPreflightPowerShellTimeout = 8 * time.Second
+
+func inspectTunPlatform(checkWFP bool) tunPlatformSnapshot {
+	snapshot := tunPlatformSnapshot{
+		HostElevated:             windows.GetCurrentProcessToken().IsElevated(),
+		PrivilegeBrokerAvailable: engineclient.PrivilegedLaunchSupported(),
+	}
+	if checkWFP {
+		snapshot.WFPReady, snapshot.WFPDetail = probeWFPEngine()
+	} else {
+		snapshot.WFPDetail = "严格路由已由用户关闭；未执行 WFP 探测"
+	}
+	routes, routeErr := readNetworkRoutes()
+	snapshot.DefaultRouteAliases, snapshot.NetworkRisks = assessNetworkRoutes(routes)
+	_, extraRisks, extraError := inspectForeignNetworkState()
+	snapshot.NetworkRisks = append(snapshot.NetworkRisks, extraRisks...)
+	if routeErr != nil {
+		snapshot.RouteScanError = routeErr.Error()
+	}
+	if extraError != "" {
+		if snapshot.RouteScanError != "" {
+			snapshot.RouteScanError += "；"
+		}
+		snapshot.RouteScanError += extraError
+	}
+	return snapshot
+}
+
+func probeWFPEngine() (bool, string) {
+	library := windows.NewLazySystemDLL("fwpuclnt.dll")
+	open := library.NewProc("FwpmEngineOpen0")
+	closeEngine := library.NewProc("FwpmEngineClose0")
+	var handle windows.Handle
+	status, _, _ := open.Call(
+		0,
+		uintptr(^uint32(0)),
+		0,
+		0,
+		uintptr(unsafe.Pointer(&handle)),
+	)
+	if status != 0 {
+		return false, fmt.Sprintf(
+			"FwpmEngineOpen0 failed (0x%08X): %s",
+			uint32(status), syscall.Errno(status).Error(),
+		)
+	}
+	if handle != 0 {
+		_, _, _ = closeEngine.Call(uintptr(handle))
+	}
+	return true, "FwpmEngineOpen0 succeeded"
+}
+
+// inspectForeignNetworkState collects all PowerShell-only network evidence in
+// one process. Starting Windows PowerShell dominated the read-only preflight;
+// the old implementation paid that cold-start cost twice on every check.
+func inspectForeignNetworkState() ([]string, []string, string) {
+	const script = `
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$inspectionErrors = @()
+$aliases = @()
+$risks = @()
+function Write-InspectionSnapshot {
+  ConvertTo-Json -InputObject @{
+    aliases = @($aliases)
+    risks = @($risks)
+    errors = @($inspectionErrors)
+  } -Compress
+}
+try {
+  $adapterPattern = '(?i)(tun|tap|wintun|wireguard|tailscale|vpn|virtual|vgate)'
+  $adapters = @(Get-NetAdapter -ErrorAction Stop)
+  foreach ($adapter in $adapters) {
+    if ($adapter.Status -eq 'Up' -and $adapter.Name -ne 'Himix-Tun' -and
+        ($adapter.Name -match $adapterPattern -or $adapter.InterfaceDescription -match $adapterPattern)) {
+      $risks += ('active foreign virtual adapter: ' + $adapter.Name + ' [' + $adapter.InterfaceDescription + ']')
+    }
+  }
+} catch {
+  $inspectionErrors += ('虚拟网卡检查失败：' + $_.Exception.Message)
+}
+Write-InspectionSnapshot
+try {
+  $forwarding = @(Get-NetIPInterface -AddressFamily IPv4 -ErrorAction Stop |
+    Where-Object { $_.Forwarding -eq 'Enabled' -and $_.InterfaceAlias -ne 'Himix-Tun' })
+  foreach ($item in $forwarding) {
+    $risks += ('IPv4 forwarding enabled: ' + $item.InterfaceAlias)
+  }
+} catch {
+  $inspectionErrors += ('IPv4 转发检查失败：' + $_.Exception.Message)
+}
+Write-InspectionSnapshot
+try {
+  $ics = Get-Service -Name SharedAccess -ErrorAction SilentlyContinue
+  if ($null -ne $ics -and $ics.Status -eq 'Running') {
+    $risks += 'Internet Connection Sharing service is running'
+  }
+} catch {
+  $inspectionErrors += ('网络共享检查失败：' + $_.Exception.Message)
+}
+Write-InspectionSnapshot
+`
+	output, err := runPreflightPowerShell(script)
+	return decodeNetworkInspection(output, err)
+}
+
+// Each completed section publishes a snapshot, so a later timeout cannot
+// erase an already detected default-route conflict.
+func decodeNetworkInspection(output []byte, inspectionErr error) ([]string, []string, string) {
+	type inspectionPayload struct {
+		Aliases []string `json:"aliases"`
+		Risks   []string `json:"risks"`
+		Errors  []string `json:"errors"`
+	}
+	var payload inspectionPayload
+	completed := false
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	for {
+		var next inspectionPayload
+		err := decoder.Decode(&next)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			inspectionErr = fmt.Errorf("网络检查结果不完整：%v；执行状态：%v", err, inspectionErr)
+			break
+		}
+		payload = next
+		completed = true
+	}
+	if !completed && inspectionErr == nil {
+		inspectionErr = fmt.Errorf("网络检查未返回结果")
+	}
+	if inspectionErr != nil {
+		payload.Errors = append(payload.Errors, fmt.Sprintf("网络检查未完成：%v", inspectionErr))
+	}
+	aliases := make([]string, 0, len(payload.Aliases))
+	seen := map[string]struct{}{}
+	for _, alias := range payload.Aliases {
+		value := strings.TrimSpace(alias)
+		key := strings.ToLower(value)
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		aliases = append(aliases, value)
+	}
+	risks := make([]string, 0, len(payload.Risks))
+	seen = make(map[string]struct{}, len(payload.Risks))
+	for _, value := range payload.Risks {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		risks = append(risks, value)
+	}
+	errors := make([]string, 0, len(payload.Errors))
+	for _, value := range payload.Errors {
+		if value = strings.TrimSpace(value); value != "" {
+			errors = append(errors, value)
+		}
+	}
+	return aliases, risks, strings.Join(errors, "；")
+}
+
+func runPreflightPowerShell(script string) ([]byte, error) {
+	powerShell, err := resolveWindowsPowerShellExecutable()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), tunPreflightPowerShellTimeout)
+	defer cancel()
+	command := exec.CommandContext(
+		ctx,
+		powerShell, "-NoProfile", "-NonInteractive",
+		"-ExecutionPolicy", "Bypass", "-Command", script,
+	)
+	configureBackgroundCommand(command)
+	output, err := command.Output()
+	if ctx.Err() != nil {
+		return output, fmt.Errorf("PowerShell 网络检查超过 %s：%w", tunPreflightPowerShellTimeout, ctx.Err())
+	}
+	return output, err
+}

@@ -1,0 +1,87 @@
+# Operating system and IDE metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vs/
+**/.vs/
+.vscode/
+.idea/
+.claude/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Logs, temporary files and local environment overrides
+*.log
+*.tmp
+*.bak
+*.swp
+.env
+.env.*
+!.env.example
+/.tmp/
+/desktop/frontend/.test-tmp/
+/desktop/frontend/.test-temp/
+
+# Python tooling caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Go caches and generated test artifacts
+/.cache/
+/.go-cache/
+/.go-cache-*/
+/.go-mod-cache/
+/.go-mod-cache-*/
+*.test
+*.prof
+*.syso
+coverage.out
+
+# Node, Vite and package-manager output
+node_modules/
+**/node_modules/
+/.pnpm-store/
+/.npm/
+/.vite/
+/dist/
+**/frontend/dist/
+*.tsbuildinfo
+.eslintcache
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Wails generated output.
+# Keep desktop/build: it contains source-controlled platform configs.
+/desktop/.task/
+/desktop/bin/
+/desktop/build/tray-review/
+/desktop/build/windows/nsis/MicrosoftEdgeWebview2Setup.exe
+
+# Local dependency/tool sandboxes
+/.appdata/
+/.tools/
+
+# Runtime configuration is stored in the user's profile.
+/config.json
+
+# Local companion skin packages and generated sample assets
+*.muxskin
+/desktop/frontend/public/skins/mux-layered-source/
+
+# Runtime payload staged at the repository root. These are large third-party
+# binaries (sing-box is ~80 MB) that the build fetches or stages locally; they
+# must never be committed. bin/README.md documents what belongs here.
+/bin/*.exe
+/bin/*.dll
+
+# Build outputs. This is a Go/Wails project: no compiled binary is ever part of
+# the source tree. The release workflow builds the installer and publishes it as
+# a release asset instead.
+*.exe
+*.dll

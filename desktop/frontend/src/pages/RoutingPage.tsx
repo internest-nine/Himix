@@ -1,0 +1,1328 @@
+import { usePageActive } from "../components/shell/PageActivity";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Badge,
+  Button,
+  Checkbox,
+  checkboxClassNames,
+  createTableColumn,
+  DataGrid,
+  DataGridBody,
+  DataGridCell,
+  DataGridHeader,
+  DataGridHeaderCell,
+  DataGridRow,
+  Dialog,
+  DialogActions,
+  DialogBody,
+  DialogContent,
+  DialogSurface,
+  DialogTitle,
+  Dropdown,
+  Input,
+  MessageBar,
+  MessageBarBody,
+  Option,
+  SearchBox,
+  Spinner,
+  Switch,
+  Tab,
+  TabList,
+  Textarea,
+  Toolbar,
+  ToolbarButton,
+  type TableColumnDefinition,
+  type TableRowId,
+} from "@fluentui/react-components";
+import { useAppNotifications } from "../components/notifications/AppNotifications";
+import {
+  Add20Regular,
+  AppGeneric20Regular,
+  ArrowDownload20Regular,
+  ArrowUpload20Regular,
+  AppsList20Regular,
+  CheckmarkCircle16Regular,
+  Delete20Regular,
+  ErrorCircle16Regular,
+  Save20Regular,
+} from "@fluentui/react-icons";
+import { appServices, type RouteProbeReport, type RoutingBatchPreview, type RoutingRule, type RoutingSnapshot, type RunningProcess } from "../platform/services";
+import { GlassSurface } from "../components/material/GlassSurface";
+import { RuleSetsPanel } from "../components/RuleSetsPanel";
+import { PageHeader } from "../components/shell/PageHeader";
+import { useI18n } from "../i18n/i18n";
+import { isDesktopRuntime } from "../platform/runtime";
+import { LatestSaveQueue } from "../platform/latestSaveQueue";
+import {
+  parseRoutingBatchValues,
+  ROUTING_BATCH_MAX_VALUES,
+  routingRuleIdentity,
+} from "./routingBatch";
+import { routingApplyState } from "./routingEffect";
+import { detectMatchKind, normalizeMatchValue } from "./domainInput";
+
+type MatchType = "process" | "domain" | "ip";
+const matchOrders = ["process,domain,ip", "process,ip,domain", "domain,process,ip", "domain,ip,process", "ip,process,domain", "ip,domain,process"];
+const normalizeOrder = (order?: string[] | null) => matchOrders.includes(order?.join(",") ?? "") ? order!.join(",") : matchOrders[0];
+type DraftRule = RoutingRule & {
+  id: string;
+  error?: string;
+  validating?: boolean;
+  dirty?: boolean;
+};
+
+const newID = () => globalThis.crypto?.randomUUID?.() ?? `rule-${Date.now()}-${Math.random()}`;
+
+export const makeDrafts = (rules: RoutingRule[]): DraftRule[] =>
+  rules.map((rule) => ({ ...rule, id: newID() }));
+
+const serializeRule = ({ match_type, value, outbound, disabled, priority }: RoutingRule): RoutingRule => ({
+  match_type, value, outbound, ...(disabled ? { disabled } : {}), ...(priority ? { priority } : {}),
+});
+
+// Backend normalization can change priority or other editable fields. Row
+// identity must remain stable so saved selections still refer to the same rule.
+const ruleKey = (rule: RoutingRule) => routingRuleIdentity(rule.match_type, rule.value);
+
+export const reconcileSavedDrafts = (saved: RoutingRule[], submitted: DraftRule[]): DraftRule[] => {
+  const available = new Map<string, DraftRule[]>();
+  submitted.forEach((draft) => {
+    const key = ruleKey(draft);
+    available.set(key, [...(available.get(key) ?? []), draft]);
+  });
+  return saved.map((rule) => {
+    const matches = available.get(ruleKey(rule)) ?? [];
+    const existing = matches.shift();
+    if (matches.length > 0) available.set(ruleKey(rule), matches);
+    else available.delete(ruleKey(rule));
+    return { ...rule, id: existing?.id ?? newID() };
+  });
+};
+
+const browserRoutingFixture = (): RoutingSnapshot | null => {
+  if (!import.meta.env.DEV || isDesktopRuntime()) return null;
+  const count = Math.max(0, Math.min(500, Number(new URLSearchParams(window.location.search).get("rules") ?? 60)));
+  const types: MatchType[] = ["process", "domain", "ip"];
+  return {
+    outbounds: [
+      { id: "aggregation", label: "多网卡聚合" },
+      { id: "direct", label: "直连" },
+      { id: "reject", label: "拒绝连接" },
+      { id: "nic_以太网", label: "以太网" },
+      { id: "nic_WLAN", label: "WLAN" },
+    ],
+    rules: Array.from({ length: count }, (_, index) => {
+      const type = types[index % types.length];
+      return {
+        match_type: type,
+        value: type === "process"
+          ? `application-${String(index + 1).padStart(2, "0")}.exe`
+          : type === "domain"
+            ? `service-${index + 1}.example.com`
+            : `10.${Math.floor(index / 256)}.${index % 256}.0/24`,
+        outbound: index % 4 === 0 ? "direct" : index % 4 === 1 ? "nic_以太网" : "aggregation",
+      };
+    }),
+    restart_required: false,
+  };
+};
+
+const browserProcessFixture = (): RunningProcess[] | null => {
+  if (!import.meta.env.DEV || isDesktopRuntime()) return null;
+  return [
+    "ApplicationFrameHost.exe",
+    "ChatGPT.exe",
+    "cmd.exe",
+    "codex.exe",
+    "conhost.exe",
+    "explorer.exe",
+    "steam.exe",
+    "WindowsTerminal.exe",
+  ].map((name) => ({ name }));
+};
+
+export function RoutingPage() {
+  const [ruleView, setRuleView] = useState<"manual" | "sets">("manual");
+  const pageActive = usePageActive();
+  const { locale, t } = useI18n();
+  const text = useCallback((zh: string, en: string) => locale === "en" ? en : zh, [locale]);
+  // Domain first: the common task is "send this website out of this network",
+  // and opening on the process tab made a pasted URL look like a bad input.
+  const matchLabels = useMemo<Record<MatchType, string>>(() => ({
+    domain: t("routing_tab_domain"),
+    process: t("routing_tab_process"),
+    ip: t("routing_tab_ip"),
+  }), [t]);
+  const placeholders = useMemo<Record<MatchType, string>>(() => ({
+    process: t("routing_placeholder_process"),
+    domain: t("routing_placeholder_domain"),
+    ip: t("routing_placeholder_ip"),
+  }), [t]);
+  const [matchOrder, setMatchOrder] = useState(matchOrders[0]);
+  const orderRef = useRef(matchOrders[0]);
+  const [rules, setRules] = useState<DraftRule[]>([]);
+  const [outbounds, setOutbounds] = useState<RoutingSnapshot["outbounds"]>([]);
+  const [activeType, setActiveType] = useState<MatchType>("domain");
+  const [filter, setFilter] = useState("");
+  const [selected, setSelected] = useState<Set<TableRowId>>(new Set());
+  useEffect(() => {
+    if (!pageActive) return;
+    const selection = rules.filter(rule => selected.has(rule.id)).slice(0, 10).map(rule => ({ type: rule.match_type, value: rule.value, outbound: rule.outbound }));
+    window.dispatchEvent(new CustomEvent("himix:ai-selection", { detail: { page: "routing", selection: selection.length ? JSON.stringify(selection) : "" } }));
+    return () => { window.dispatchEvent(new CustomEvent("himix:ai-selection", { detail: { page: "routing", selection: "" } })); };
+  }, [rules, selected, pageActive]);
+  const [newValue, setNewValue] = useState("");
+  // Live echo of what a pasted value will become, and of the tab it will land
+  // in. The user sees the real rule before committing it.
+  const pasteIntent = useMemo(() => {
+    const raw = newValue.trim();
+    if (!raw) return null;
+    const kind = detectMatchKind(raw);
+    if (!kind) return null;
+    const value = normalizeMatchValue(raw, kind);
+    if (!value) return null;
+    const reassigned = kind !== activeType;
+    if (!reassigned && value === raw.toLowerCase()) return null;
+    return { kind, value, reassigned };
+  }, [activeType, newValue]);
+
+  const [newOutbound, setNewOutbound] = useState("aggregation");
+  // Result of the last outbound probe, kept so the user can see which line was
+  // actually able to reach the target instead of guessing.
+  const [lastProbe, setLastProbe] = useState<RouteProbeReport | null>(null);
+  const [probePending, setProbePending] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [checkingOutbounds, setCheckingOutbounds] = useState(false);
+  const [savedAt, setSavedAt] = useState("");
+  const [pendingSave, setPendingSave] = useState(false);
+  const [engineRuntime, setEngineRuntime] = useState({ phase: "stopped", mode: "tun" });
+  const [restartRequirement, setRestartRequirement] = useState({ required: false, reason: "" });
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [processOpen, setProcessOpen] = useState(false);
+  const [processes, setProcesses] = useState<RunningProcess[]>([]);
+  const [processSearch, setProcessSearch] = useState("");
+  const [processLoading, setProcessLoading] = useState(false);
+  const [importPreview, setImportPreview] = useState<RoutingSnapshot | null>(null);
+  const [importPreviewOpen, setImportPreviewOpen] = useState(false);
+  const [batchOpen, setBatchOpen] = useState(false);
+  const [batchType, setBatchType] = useState<MatchType>("domain");
+  const [batchOutbound, setBatchOutbound] = useState("aggregation");
+  const [batchText, setBatchText] = useState("");
+  const [batchPreview, setBatchPreview] = useState<RoutingBatchPreview | null>(null);
+  const [batchChecking, setBatchChecking] = useState(false);
+  const [batchApplying, setBatchApplying] = useState(false);
+  const [replaceBatchConflicts, setReplaceBatchConflicts] = useState(false);
+  const batchValueCount = useMemo(() => parseRoutingBatchValues(batchText, batchType).length, [batchText, batchType]);
+  const loaded = useRef(false);
+  const loadRequest = useRef(0);
+  const backendRevision = useRef<string>();
+  const rulesRef = useRef<DraftRule[]>([]);
+  const editRevision = useRef(0);
+  const submittedRevision = useRef(-1);
+  const autosaveTimer = useRef<number>();
+  const validationSequence = useRef(new Map<string, number>());
+  const validationTimers = useRef(new Map<string, number>());
+  const saveQueue = useRef<LatestSaveQueue<{ rules: RoutingRule[]; order: string[] }, RoutingSnapshot>>();
+  if (!saveQueue.current) {
+    saveQueue.current = new LatestSaveQueue(async (next) => {
+      const snapshot = backendRevision.current === undefined
+        ? await appServices.routing.save(next.rules, next.order)
+        : await appServices.routing.save(next.rules, next.order, backendRevision.current);
+      backendRevision.current = snapshot.revision;
+      return snapshot;
+    });
+  }
+  const addRuleInputRef = useRef<HTMLInputElement>(null);
+  const addRulePending = useRef(false);
+  const { notify: pushNotification } = useAppNotifications();
+
+  const notify = useCallback((title: string, message: string, intent: "success" | "error" | "warning" | "info" = "info") => {
+    pushNotification({ title, message, intent, dedupeKey: `routing:${intent}:${title}` });
+  }, [pushNotification]);
+
+  const applyResult = useCallback((snapshot: RoutingSnapshot) => {
+    setRestartRequirement({
+      required: snapshot.restart_required,
+      reason: snapshot.restart_reason ?? "",
+    });
+    const state = routingApplyState(snapshot, engineRuntime.phase, engineRuntime.mode);
+    if (state === "hot_reloaded") {
+      return {
+        message: text("已有连接保持当前路径，新连接立即使用新规则。", "Existing connections keep their current path; new connections use the updated rules immediately."),
+        intent: "success" as const,
+      };
+    }
+    if (state === "restart_required") {
+      return {
+        message: snapshot.restart_reason === "enable_fakeip"
+          ? text("规则已保存。请重启聚合以启用域名分流所需的 DNS 配置。", "Rules were saved. Restart aggregation to enable the DNS configuration required for domain routing.")
+          : text("规则已保存。请重启聚合以完整加载这项更改。", "Rules were saved. Restart aggregation to load this change completely."),
+        intent: "warning" as const,
+      };
+    }
+    if (state === "inactive_mode") {
+      return {
+        message: text("规则已保存，但仅由 TUN 模式加载；当前系统代理流量不会切换出口。", "Rules were saved but are loaded only in TUN mode; current system-proxy traffic will not switch egress."),
+        intent: "info" as const,
+      };
+    }
+    return {
+      message: text("规则已保存，将在下次启动 TUN 模式时生效。", "Rules were saved and will take effect the next time TUN mode starts."),
+      intent: "info" as const,
+    };
+  }, [engineRuntime.mode, engineRuntime.phase, text]);
+
+  const load = useCallback(async (quiet = false) => {
+    const request = ++loadRequest.current;
+    const revision = editRevision.current;
+    if (!quiet) setLoading(true);
+    const engineTask = appServices.engine.snapshot()
+      .then((engine) => {
+        if (request === loadRequest.current) setEngineRuntime({ phase: engine.phase, mode: engine.mode });
+      })
+      .catch(() => undefined);
+    try {
+      const snapshot = await appServices.routing.snapshot();
+      if (request !== loadRequest.current || (quiet && revision !== editRevision.current)) return;
+      backendRevision.current = snapshot.revision;
+      orderRef.current = normalizeOrder(snapshot.match_order);
+      setMatchOrder(orderRef.current);
+      const available = new Set((snapshot.outbounds ?? []).map((outbound) => outbound.id));
+      const nextRules = reconcileSavedDrafts(snapshot.rules ?? [], rulesRef.current).map((rule) => rule.disabled || available.has(rule.outbound)
+        ? rule
+        : {
+            ...rule,
+            error: text(
+              `出口 ${rule.outbound.replace(/^nic_/, "")} 未启用或当前不可用`,
+              `Outbound ${rule.outbound.replace(/^nic_/, "")} is disabled or unavailable`,
+            ),
+          });
+      rulesRef.current = nextRules;
+      setRules(nextRules);
+      setOutbounds(snapshot.outbounds ?? []);
+      setRestartRequirement({ required: snapshot.restart_required, reason: snapshot.restart_reason ?? "" });
+      setPendingSave(false);
+      setSavedAt(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
+      loaded.current = true;
+    } catch (error) {
+      if (quiet || request !== loadRequest.current) return;
+      const fixture = browserRoutingFixture();
+      if (fixture) {
+        const nextRules = makeDrafts(fixture.rules ?? []);
+        rulesRef.current = nextRules;
+        setRules(nextRules);
+        setOutbounds(fixture.outbounds ?? []);
+        setSavedAt(text("界面预览（未连接核心）", "UI preview (core not connected)"));
+        loaded.current = true;
+      } else {
+        notify(text("无法读取分流规则", "Unable to load routing rules"), error instanceof Error ? error.message : String(error), "error");
+      }
+    } finally {
+      if (!quiet && request === loadRequest.current) setLoading(false);
+    }
+    void engineTask;
+  }, [notify, text]);
+
+  const localEdits = useRef(false);
+  localEdits.current = pendingSave || saving;
+  useEffect(() => {
+    if (pageActive && !localEdits.current) void load(loaded.current);
+  }, [load, pageActive]);
+
+  useEffect(() => {
+    const changed = () => {
+      if (pendingSave || saving) {
+        notify(text("AI 已更新配置", "AI updated the configuration"), text("当前仍有本地编辑，请先核对最新规则，避免覆盖 AI 的修改。", "Local edits are pending. Review the latest rules before overwriting AI changes."), "warning");
+      } else {
+        void load();
+      }
+    };
+    window.addEventListener("himix:ai-changed", changed);
+    return () => window.removeEventListener("himix:ai-changed", changed);
+  }, [load, pendingSave, saving, notify, text]);
+
+  useEffect(() => () => {
+    if (autosaveTimer.current !== undefined) window.clearTimeout(autosaveTimer.current);
+    validationTimers.current.forEach((timer) => window.clearTimeout(timer));
+  }, []);
+
+  const applyRules = useCallback((next: DraftRule[], markDirty = false) => {
+    rulesRef.current = next;
+    setRules(next);
+    if (markDirty) {
+      editRevision.current += 1;
+      setPendingSave(true);
+    }
+  }, []);
+
+  // A rule that points at an adapter with no path to the target looks configured
+  // but silently drops traffic. Probing each adapter with the real target — and
+  // switching only when the picked one provably fails — turns "有效" into a claim
+  // that was actually tested.
+  const probeOutbound = useCallback(async (rawValue: string, ruleID: string) => {
+    setProbePending(true);
+    try {
+      const report = await appServices.routeProbe.probe(rawValue);
+      const hops = report.hops ?? [];
+      if (hops.length === 0) return;
+      setLastProbe(report);
+      const recommended = report.recommended_adapter_id;
+      const current = rulesRef.current.find((rule) => rule.id === ruleID);
+      const chosen = current ? hops.find((hop) => `nic_${hop.adapter_id}` === current.outbound) : undefined;
+      const reachable = hops.filter((hop) => hop.ok);
+      const best = recommended ? hops.find((hop) => hop.adapter_id === recommended) : undefined;
+      // Two cases deserve an automatic decision: the picked adapter provably
+      // cannot reach the target, or aggregation is set while only one line can.
+      // Aggregation with a dead line makes an intranet site fail intermittently,
+      // which is worse than pinning it to the single line that works.
+      const chosenFails = Boolean(chosen && !chosen.ok);
+      const pinnedByAggregation = current?.outbound === "aggregation" && reachable.length === 1 && hops.length > 1;
+      if (recommended && best && (chosenFails || pinnedByAggregation)) {
+        const next = rulesRef.current.map((rule) =>
+          rule.id === ruleID ? { ...rule, outbound: `nic_${recommended}` } : rule,
+        );
+        applyRules(next, true);
+        notify(
+          text("已自动改走能通的那条线", "Switched to the line that works"),
+          chosenFails
+            ? text(
+              `${chosen?.adapter_name} 到不了 ${report.host}，${report.recommended_name} 可以（${best.latency_ms}ms）`,
+              `${chosen?.adapter_name} cannot reach ${report.host}; ${report.recommended_name} can (${best.latency_ms}ms)`,
+            )
+            : text(
+              `只有 ${report.recommended_name} 能到 ${report.host}（${best.latency_ms}ms），已把这条规则固定到它，避免时通时不通`,
+              `Only ${report.recommended_name} reaches ${report.host} (${best.latency_ms}ms); the rule is pinned to it so it stops failing intermittently`,
+            ),
+          "info",
+        );
+        return;
+      }
+      if (!recommended) {
+        notify(
+          text("每条线都试过了，都不通", "Every line was tried and none worked"),
+          text(
+            `${report.host} 在 ${hops.map((hop) => hop.adapter_name).join("、")} 上都连不上，可能是站点本身、端口或需要先登录内网`,
+            `${report.host} is unreachable on ${hops.map((hop) => hop.adapter_name).join(", ")} — the site, its port, or a login may be the blocker`,
+          ),
+          "warning",
+        );
+      }
+    } catch (error) {
+      // Probing is advisory. A failed probe must never block the rule that was
+      // just created, so the reason is only surfaced to the console.
+      console.warn("route probe failed", error);
+    } finally {
+      setProbePending(false);
+    }
+  }, [applyRules, notify, text]);
+
+  const validateDraft = useCallback(async (draft: DraftRule) => {    const sequence = (validationSequence.current.get(draft.id) ?? 0) + 1;
+    validationSequence.current.set(draft.id, sequence);
+    try {
+      if (!Number.isInteger(draft.priority ?? 0) || (draft.priority ?? 0) < 0 || (draft.priority ?? 0) > 999) {
+        throw new Error(text("优先级必须是 0–999 的整数", "Priority must be an integer from 0 to 999"));
+      }
+      const currentRules = rulesRef.current
+        .filter((item) => item.id !== draft.id)
+        .map(serializeRule);
+      const result = await appServices.routing.validate(draft, currentRules);
+      if (validationSequence.current.get(draft.id) !== sequence) return;
+      const next = rulesRef.current.map((item) =>
+        item.id === draft.id
+          ? { ...item, ...result.rule, validating: false, error: result.valid ? undefined : result.message, dirty: true }
+          : item);
+      applyRules(next);
+    } catch (error) {
+      if (validationSequence.current.get(draft.id) !== sequence) return;
+      const next = rulesRef.current.map((item) =>
+        item.id === draft.id
+          ? { ...item, validating: false, error: error instanceof Error ? error.message : String(error), dirty: true }
+          : item);
+      applyRules(next);
+    }
+  }, [applyRules, text]);
+
+  const updateRule = useCallback((id: string, patch: Partial<RoutingRule>) => {
+    validationSequence.current.set(id, (validationSequence.current.get(id) ?? 0) + 1);
+    let nextDraft: DraftRule | undefined;
+    const next = rulesRef.current.map((item) => {
+      if (item.id !== id) return item;
+      nextDraft = { ...item, ...patch, validating: true, error: undefined, dirty: true };
+      return nextDraft;
+    });
+    applyRules(next, true);
+    const existingTimer = validationTimers.current.get(id);
+    if (existingTimer !== undefined) window.clearTimeout(existingTimer);
+    const timer = window.setTimeout(() => {
+      validationTimers.current.delete(id);
+      if (nextDraft) void validateDraft(nextDraft);
+    }, 180);
+    validationTimers.current.set(id, timer);
+  }, [applyRules, validateDraft]);
+
+  const saveRules = useCallback(async (showToast = false) => {
+    if (showToast && autosaveTimer.current !== undefined) {
+      window.clearTimeout(autosaveTimer.current);
+      autosaveTimer.current = undefined;
+    }
+    const submitted = rulesRef.current.map((rule) => ({ ...rule }));
+    const submittedEditRevision = editRevision.current;
+    const invalid = submitted.find((rule) => rule.validating || rule.error || !rule.value.trim());
+    if (invalid) {
+      if (showToast) notify(
+        text("尚未保存", "Not saved"),
+        invalid.error || text("请等待规则校验完成", "Please wait for rule validation to finish"),
+        "error",
+      );
+      return false;
+    }
+    setSaving(true);
+    submittedRevision.current = submittedEditRevision;
+    const queue = saveQueue.current!;
+    const handle = queue.enqueue(
+      { rules: submitted.map(serializeRule), order: orderRef.current.split(",") },
+    );
+    try {
+      const snapshot = await handle.done;
+      if (!queue.isCurrent(handle.revision) || submittedEditRevision !== editRevision.current) return true;
+      const savedRules = reconcileSavedDrafts(snapshot.rules ?? [], submitted);
+      applyRules(savedRules);
+      setOutbounds(snapshot.outbounds ?? []);
+      const applied = applyResult(snapshot);
+      setSavedAt(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
+      setPendingSave(false);
+      if (showToast) notify(
+        text("规则已保存", "Rules saved"),
+        applied.message,
+        applied.intent,
+      );
+      return true;
+    } catch (error) {
+      if (queue.isCurrent(handle.revision)) {
+        notify(text("保存失败", "Save failed"), error instanceof Error ? error.message : String(error), "error");
+      }
+      return false;
+    } finally {
+      if (queue.isCurrent(handle.revision)) setSaving(false);
+    }
+  }, [applyResult, applyRules, notify, text]);
+
+  useEffect(() => {
+    if (!loaded.current || !pendingSave || rules.some((rule) => rule.validating || rule.error)) {
+      return;
+    }
+    autosaveTimer.current = window.setTimeout(() => {
+      autosaveTimer.current = undefined;
+      if (saveQueue.current?.isPending() && submittedRevision.current === editRevision.current) return;
+      void saveRules(false);
+    }, 700);
+    return () => {
+      if (autosaveTimer.current !== undefined) {
+        window.clearTimeout(autosaveTimer.current);
+        autosaveTimer.current = undefined;
+      }
+    };
+  }, [pendingSave, rules, saveRules]);
+
+  const addRule = useCallback(async (rawValue = newValue, type: MatchType = activeType) => {
+    if (addRulePending.current) return;
+    // Decide the rule kind from the value itself. The editor opens on the
+    // process tab, so a pasted URL would otherwise be submitted as a process
+    // name and rejected by the engine with a format error.
+    const detected = detectMatchKind(rawValue);
+    const effectiveType: MatchType = detected ?? type;
+    // Accept pasted URLs: reduce them to the host the engine expects instead of
+    // bouncing the user back with a format error.
+    const value = normalizeMatchValue(rawValue, effectiveType);
+    if (!value) {
+      notify(
+        text("识别不出要匹配的内容", "Could not read that value"),
+        effectiveType === "domain"
+          ? text("请填域名或直接粘贴网址，例如 https://www.example.com/page", "Enter a domain or paste a URL, e.g. https://www.example.com/page")
+          : effectiveType === "ip"
+            ? text("请填 IP 地址或网段，例如 203.0.113.8 或 203.0.113.0/24", "Enter an IP address or subnet, e.g. 203.0.113.8 or 203.0.113.0/24")
+            : text("程序名只写名字就行，例如 chrome.exe，不要带路径或冒号", "Use just the executable name, e.g. chrome.exe — no path or colon"),
+        "error",
+      );
+      return;
+    }
+    addRulePending.current = true;
+    try {
+      const candidate: DraftRule = {
+        id: newID(),
+        match_type: effectiveType,
+        value,
+        outbound: newOutbound,
+        validating: true,
+        dirty: true,
+      };
+      const result = await appServices.routing.validate(
+        candidate,
+        rulesRef.current.map(serializeRule),
+      );
+      if (!result.valid) {
+        notify(
+          result.duplicate ? text("规则已存在", "Rule already exists") : text("规则格式无效", "Invalid rule format"),
+          result.message || text("请检查匹配值", "Check the match value"),
+          "error",
+        );
+        return;
+      }
+      if (detected && detected !== type) {
+        // Move the editor to the tab the rule actually landed in, otherwise the
+        // new row appears to have vanished into a list the user is not looking at.
+        setActiveType(detected);
+        notify(
+          text("已自动归类", "Sorted automatically"),
+          text(
+            `识别为${matchLabels[detected]}，已保存 “${value}”`,
+            `Read as ${matchLabels[detected]}; saved “${value}”`,
+          ),
+          "info",
+        );
+      }
+      applyRules([...rulesRef.current, { ...candidate, ...result.rule, validating: false }], true);
+      setNewValue((current) => current === rawValue ? "" : current);
+      // Probe after the rule lands so the UI never waits on the network, and
+      // probe the raw input so a typed port (:8081) is the port tested.
+      if (effectiveType !== "process") {
+        void probeOutbound(rawValue, candidate.id);
+      }
+    } catch (error) {
+      notify(text("添加规则失败", "Unable to add rule"), String(error), "error");
+    } finally {
+      addRulePending.current = false;
+    }
+  }, [activeType, applyRules, matchLabels, newOutbound, newValue, notify, probeOutbound, text]);
+
+  const openProcesses = useCallback(async () => {
+    setProcessOpen(true);
+    setProcessLoading(true);
+    setProcessSearch("");
+    try {
+      setProcesses((await appServices.routing.listProcessChoices()) ?? []);
+    } catch (error) {
+      const fixture = browserProcessFixture();
+      if (fixture) {
+        setProcesses(fixture);
+      } else {
+        notify(text("无法读取进程", "Unable to list processes"), error instanceof Error ? error.message : String(error), "error");
+        setProcesses([]);
+      }
+    } finally {
+      setProcessLoading(false);
+    }
+  }, [notify, text]);
+
+  const importRules = useCallback(async () => {
+    try {
+      const preview = await appServices.routing.importRules();
+      setImportPreview(preview);
+      setImportPreviewOpen(true);
+    } catch (error) {
+      notify(text("导入失败", "Import failed"), error instanceof Error ? error.message : String(error), "error");
+    }
+  }, [notify, text]);
+
+  const confirmImport = useCallback(async () => {
+    if (!importPreview) return;
+    if (autosaveTimer.current !== undefined) {
+      window.clearTimeout(autosaveTimer.current);
+      autosaveTimer.current = undefined;
+    }
+    const previous = rulesRef.current;
+    const imported = makeDrafts(importPreview.rules ?? []);
+    applyRules(imported, true);
+    setPendingSave(false);
+    setSaving(true);
+    const queue = saveQueue.current!;
+    const importedEditRevision = editRevision.current;
+    const handle = queue.enqueue({ rules: importPreview.rules ?? [], order: normalizeOrder(importPreview.match_order).split(",") });
+    try {
+      const saved = await handle.done;
+      if (!queue.isCurrent(handle.revision) || importedEditRevision !== editRevision.current) return;
+      applyRules(reconcileSavedDrafts(saved.rules ?? [], imported));
+      setOutbounds(saved.outbounds ?? []);
+      orderRef.current = normalizeOrder(saved.match_order ?? orderRef.current.split(","));
+      setMatchOrder(orderRef.current);
+      const applied = applyResult(saved);
+      setImportPreviewOpen(false);
+      setSelected(new Set());
+      setPendingSave(false);
+      notify(
+        text("导入完成", "Import complete"),
+        applied.message,
+        applied.intent,
+      );
+    } catch (error) {
+      if (queue.isCurrent(handle.revision) && importedEditRevision === editRevision.current) {
+        applyRules(previous, true);
+        notify(text("导入失败", "Import failed"), error instanceof Error ? error.message : String(error), "error");
+      }
+    } finally {
+      if (queue.isCurrent(handle.revision)) setSaving(false);
+    }
+  }, [applyResult, applyRules, importPreview, notify, text]);
+
+  const openBatch = useCallback(() => {
+    setBatchType(activeType);
+    setBatchOutbound(newOutbound);
+    setBatchText("");
+    setBatchPreview(null);
+    setReplaceBatchConflicts(false);
+    setBatchOpen(true);
+  }, [activeType, newOutbound]);
+
+  const previewBatch = useCallback(async () => {
+    const values = parseRoutingBatchValues(batchText, batchType);
+    if (values.length === 0) {
+      notify(text("没有可检查的内容", "Nothing to check"), text("请先输入至少一个匹配值。", "Enter at least one match value."), "error");
+      return;
+    }
+    if (values.length > ROUTING_BATCH_MAX_VALUES) {
+      notify(
+        text("批量内容过多", "Batch is too large"),
+        text(`单次最多添加 ${ROUTING_BATCH_MAX_VALUES} 条，当前识别到 ${values.length} 条。`, `A batch can contain up to ${ROUTING_BATCH_MAX_VALUES} values; ${values.length} were found.`),
+        "error",
+      );
+      return;
+    }
+    setBatchChecking(true);
+    try {
+      const preview = await appServices.routing.previewBatch(
+        batchType,
+        values,
+        batchOutbound,
+        rulesRef.current.map(serializeRule),
+      );
+      setBatchPreview({ ...preview, items: preview.items ?? [] });
+    } catch (error) {
+      setBatchPreview(null);
+      notify(text("批量检查失败", "Batch check failed"), error instanceof Error ? error.message : String(error), "error");
+    } finally {
+      setBatchChecking(false);
+    }
+  }, [batchOutbound, batchText, batchType, notify, text]);
+
+  const confirmBatch = useCallback(async () => {
+    if (!batchPreview || batchPreview.invalid_count > 0) return;
+    const accepted = (batchPreview.items ?? []).filter((item) =>
+      item.status === "add" || (replaceBatchConflicts && item.status === "conflict"));
+    if (accepted.length === 0) {
+      notify(text("没有需要添加的规则", "No rules to add"), text("输入内容均已存在或被跳过。", "All values already exist or were skipped."));
+      return;
+    }
+    const invalidDraft = rulesRef.current.find((rule) => rule.validating || rule.error || !rule.value.trim());
+    if (invalidDraft) {
+      notify(
+        text("暂时不能批量保存", "Cannot save the batch yet"),
+        invalidDraft.error || text("请先完成当前列表中的规则校验。", "Finish validating the current rules first."),
+        "error",
+      );
+      return;
+    }
+
+    if (autosaveTimer.current !== undefined) {
+      window.clearTimeout(autosaveTimer.current);
+      autosaveTimer.current = undefined;
+    }
+    const previous = rulesRef.current;
+    const replacementKeys = new Set(
+      accepted
+        .filter((item) => item.status === "conflict")
+        .map((item) => routingRuleIdentity(item.rule.match_type, item.rule.value)),
+    );
+    const previousByIdentity = new Map(previous.map((rule) => [routingRuleIdentity(rule.match_type, rule.value), rule]));
+    const next = [
+      ...previous.filter((rule) => !replacementKeys.has(routingRuleIdentity(rule.match_type, rule.value))),
+      ...accepted.map((item) => {
+        const existing = previousByIdentity.get(routingRuleIdentity(item.rule.match_type, item.rule.value));
+        return existing
+          ? { ...item.rule, disabled: existing.disabled, priority: existing.priority, id: existing.id, dirty: true }
+          : { ...item.rule, id: newID(), dirty: true };
+      }),
+    ];
+    applyRules(next, true);
+    setPendingSave(false);
+    setSaving(true);
+    setBatchApplying(true);
+    const queue = saveQueue.current!;
+    const batchEditRevision = editRevision.current;
+    const handle = queue.enqueue({ rules: next.map(serializeRule), order: orderRef.current.split(",") });
+    try {
+      const saved = await handle.done;
+      if (!queue.isCurrent(handle.revision) || batchEditRevision !== editRevision.current) return;
+      applyRules(reconcileSavedDrafts(saved.rules ?? [], next));
+      setOutbounds(saved.outbounds ?? []);
+      orderRef.current = normalizeOrder(saved.match_order ?? orderRef.current.split(","));
+      setMatchOrder(orderRef.current);
+      const applied = applyResult(saved);
+      setSavedAt(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
+      setPendingSave(false);
+      setSelected(new Set());
+      setActiveType(batchType);
+      setBatchOpen(false);
+      notify(
+        text("批量添加完成", "Batch added"),
+        applied.message,
+        applied.intent,
+      );
+    } catch (error) {
+      if (queue.isCurrent(handle.revision) && batchEditRevision === editRevision.current) {
+        applyRules(previous, true);
+        notify(text("批量保存失败", "Batch save failed"), error instanceof Error ? error.message : String(error), "error");
+      }
+    } finally {
+      if (queue.isCurrent(handle.revision)) {
+        setSaving(false);
+        setBatchApplying(false);
+      }
+    }
+  }, [applyResult, applyRules, batchPreview, batchType, notify, replaceBatchConflicts, text]);
+
+  const activeRules = useMemo(() => rules.filter((rule) => {
+    if (rule.match_type !== activeType) return false;
+    const keyword = filter.trim().toLowerCase();
+    return !keyword || rule.value.toLowerCase().includes(keyword) ||
+      (outbounds ?? []).find((outbound) => outbound.id === rule.outbound)?.label.toLowerCase().includes(keyword);
+  }), [activeType, filter, outbounds, rules]);
+
+  const outboundLabel = useCallback((id: string) => {
+    if (id === "aggregation") return t("routing_outbound_aggregation");
+    if (id === "direct") return t("routing_outbound_direct");
+    if (id === "reject") return t("routing_outbound_reject");
+    return (outbounds ?? []).find((outbound) => outbound.id === id)?.label ?? id.replace(/^nic_/, "");
+  }, [outbounds, t]);
+
+  const disableUnavailableRules = useCallback(async () => {
+    setCheckingOutbounds(true);
+    try {
+      const snapshot = await appServices.routing.snapshot();
+      setOutbounds(snapshot.outbounds ?? []);
+      const available = new Set((snapshot.outbounds ?? []).map((item) => item.id));
+      const targets = rulesRef.current.filter((rule) => !rule.disabled && rule.outbound.startsWith("nic_") && !available.has(rule.outbound));
+      // Use the normal validation and save queue so edits in flight cannot restore an old state.
+      targets.forEach((rule) => updateRule(rule.id, { disabled: true }));
+      notify(text("出口检查完成", "Egress check complete"), targets.length
+        ? text(`已禁用 ${targets.length} 条失效出口规则，校验完成后自动保存。可随时重新启用。`, `Disabled ${targets.length} unavailable-egress rules; changes save after validation. You can enable them again.`)
+        : text("没有需要禁用的失效出口规则。", "No unavailable-egress rules need disabling."));
+    } catch (error) {
+      notify(text("出口检查失败", "Egress check failed"), error instanceof Error ? error.message : String(error), "error");
+    } finally {
+      setCheckingOutbounds(false);
+    }
+  }, [notify, text, updateRule]);
+
+  const columns: TableColumnDefinition<DraftRule>[] = useMemo(() => [
+    createTableColumn<DraftRule>({
+      columnId: "enabled",
+      renderHeaderCell: () => text("启用", "Enabled"),
+      renderCell: (item) => <Switch checked={!item.disabled} aria-label={text(`启用规则 ${item.value}`, `Enable rule ${item.value}`)} onChange={(_, data) => updateRule(item.id, { disabled: !data.checked })} />,
+    }),
+    createTableColumn<DraftRule>({
+      columnId: "value",
+      renderHeaderCell: () => text("匹配值", "Match value"),
+      renderCell: (item) => (
+        <Input
+          aria-label={text(`匹配值：${item.value}`, `Match value: ${item.value}`)} spellCheck={false} autoComplete="off" className="routing-cell-input"
+          value={item.value}
+          appearance="filled-darker"
+          aria-invalid={Boolean(item.error)}
+          onChange={(_, data) => updateRule(item.id, { value: data.value })}
+        />
+      ),
+    }),
+    createTableColumn<DraftRule>({
+      columnId: "outbound",
+      renderHeaderCell: () => t("routing_col_nic"),
+      renderCell: (item) => (
+        <Dropdown
+          aria-label={text(`出口：${item.value}`, `Egress: ${item.value}`)} className="routing-cell-dropdown"
+          appearance="filled-darker"
+          value={outboundLabel(item.outbound)}
+          selectedOptions={[item.outbound]}
+          onOptionSelect={(_, data) => data.optionValue && updateRule(item.id, { outbound: data.optionValue })}
+        >
+          {(outbounds ?? []).map((outbound) => (
+            <Option key={outbound.id} value={outbound.id}>{outboundLabel(outbound.id)}</Option>
+          ))}
+          {!(outbounds ?? []).some((outbound) => outbound.id === item.outbound) && (
+            <Option value={item.outbound}>{outboundLabel(item.outbound)}</Option>
+          )}
+        </Dropdown>
+      ),
+    }),
+    createTableColumn<DraftRule>({
+      columnId: "status",
+      renderHeaderCell: () => text("状态", "Status"),
+      renderCell: (item) => item.validating
+        ? <span className="routing-rule-status is-validating"><Spinner size="tiny" />{text("校验中", "Validating")}</span>
+        : item.error
+          ? <span className="routing-rule-status is-error" title={item.error}><ErrorCircle16Regular /><span>{item.error}</span></span>
+          : item.disabled ? <span className="routing-rule-status">{text("已禁用", "Disabled")}</span>
+          : <span className="routing-rule-status is-valid"><CheckmarkCircle16Regular />{text("有效", "Valid")}</span>,
+    }),
+  ], [outboundLabel, outbounds, t, text, updateRule]);
+
+  const counts = useMemo(() => ({
+    process: rules.filter((rule) => rule.match_type === "process").length,
+    domain: rules.filter((rule) => rule.match_type === "domain").length,
+    ip: rules.filter((rule) => rule.match_type === "ip").length,
+  }), [rules]);
+
+  const filteredProcesses = useMemo(() => {
+    const keyword = processSearch.trim().toLowerCase();
+    return processes.filter((process) => !keyword || process.name.toLowerCase().includes(keyword));
+  }, [processSearch, processes]);
+
+  return (
+    <main className={`routing-page${ruleView === "sets" ? " routing-page-sets" : ""}`}>
+      <PageHeader
+        kicker={t("routing_title")}
+        title={text("指定哪个程序、网站走哪条网络", "Choose which network each app or site uses")}
+        description={t("routing_hint")}
+        actions={ruleView === "manual" && <div className="routing-save-state">
+          <Button disabled={saving || loading} onClick={() => {
+            if (!pendingSave || window.confirm(text("重新载入会丢弃当前未保存的规则编辑，是否继续？", "Reloading discards unsaved rule edits. Continue?"))) void load();
+          }}>{text("重新载入", "Reload")}</Button>
+          <span key={saving ? "saving" : pendingSave ? "pending" : savedAt ? "saved" : "loading"} className="motion-inline-swap">{saving
+            ? text("正在保存…", "Saving…")
+            : pendingSave
+              ? text("有未保存更改", "Unsaved changes")
+            : savedAt
+              ? text(`已保存 ${savedAt}`, `Saved ${savedAt}`)
+              : text("读取当前配置", "Loading current configuration")}</span>
+          <Button appearance={pendingSave ? "primary" : "secondary"} icon={saving ? <Spinner size="tiny" /> : <Save20Regular />} disabled={saving || !pendingSave} onClick={() => void saveRules(true)}>
+            {text("保存更改", "Save changes")}
+          </Button>
+        </div>}
+      />
+      <TabList className="page-tabs" aria-label={text("规则管理", "Rule management")} selectedValue={ruleView} onTabSelect={(_, data) => setRuleView(data.value as "manual" | "sets")}>
+        <Tab value="manual">{text("手动规则", "Manual rules")}</Tab>
+        <Tab value="sets">{text("规则集订阅", "Rule set subscriptions")}</Tab>
+      </TabList>
+
+      <div className="routing-notice-slot">
+        {engineRuntime.mode !== "tun" ? (
+          <MessageBar intent="info">
+            <MessageBarBody>{text(
+              "分流规则仅由 TUN 模式加载；当前系统代理流量不会根据这些规则切换出口或拒绝连接。",
+              "Routing rules are loaded only in TUN mode; current system-proxy traffic is not routed or blocked by these rules.",
+            )}</MessageBarBody>
+          </MessageBar>
+        ) : (engineRuntime.phase === "running" || engineRuntime.phase === "degraded") ? (
+          <MessageBar intent={restartRequirement.required ? "warning" : "info"}>
+            <MessageBarBody>{restartRequirement.required
+              ? restartRequirement.reason === "enable_fakeip"
+                ? text(
+                    "规则已保存，但域名分流所需的 DNS 配置尚未启用；请重启聚合以完整生效。",
+                    "Rules are saved, but the DNS configuration required for domain routing is not active; restart aggregation for full effect.",
+                  )
+                : text(
+                    "规则已保存，但当前 TUN 配置无法完整加载这项更改；请重启聚合。",
+                    "Rules are saved, but the current TUN configuration cannot load this change completely; restart aggregation.",
+                  )
+              : text(
+                  "规则保存后会自动热更新；已有连接保持当前路径，新连接使用新规则。",
+                  "Saved rules are hot-reloaded automatically. Existing connections keep their current path; new connections use the updated rules.",
+                )}</MessageBarBody>
+          </MessageBar>
+        ) : null}
+      </div>
+
+      {ruleView === "manual" ? <>
+      <GlassSurface className="routing-toolbar-surface" tone="secondary">
+        <div className="routing-type-bar">
+        <TabList selectedValue={activeType} onTabSelect={(_, data) => {
+          setActiveType(data.value as MatchType);
+          setSelected(new Set());
+        }}>
+          {(Object.keys(matchLabels) as MatchType[]).map((type) => (
+            <Tab key={type} value={type}>{matchLabels[type]} · {counts[type]}</Tab>
+          ))}
+        </TabList>
+        <div className="routing-order-control">
+          <span id="routing-order-label">{text("匹配顺序", "Match order")}</span>
+          <Dropdown aria-labelledby="routing-order-label" aria-describedby="routing-order-hint"
+            value={matchOrder.split(",").map((kind) => kind === "ip" ? "IP" : kind === "domain" ? text("域名", "Domain") : text("进程", "Process")).join(" → ")}
+            selectedOptions={[matchOrder]} disabled={loading || saving || batchApplying}
+            onOptionSelect={(_, data) => {
+              if (!data.optionValue) return;
+              orderRef.current = data.optionValue;
+              setMatchOrder(data.optionValue);
+              applyRules(rulesRef.current.map((rule) => ({ ...rule, priority: 2 - data.optionValue!.split(",").indexOf(rule.match_type) })), true);
+              // A discrete selection must survive navigation before the typing
+              // debounce expires. The save queue remains alive after unmount.
+              void saveRules(true);
+            }}>
+            {matchOrders.map((order) => <Option key={order} value={order}>{order.split(",").map((kind) => kind === "ip" ? "IP" : kind === "domain" ? text("域名", "Domain") : text("进程", "Process")).join(" → ")}</Option>)}
+          </Dropdown>
+          <span id="routing-order-hint">{text("从左到右优先", "Leftmost first")}</span>
+        </div>
+        </div>
+        <div className="routing-add-row">
+          <Input
+            aria-label={text("新规则匹配值", "New rule match value")} spellCheck={false} autoComplete="off" ref={addRuleInputRef}
+            value={newValue}
+            placeholder={placeholders[activeType]}
+            onChange={(_, data) => setNewValue(data.value)}
+            onKeyDown={(event) => {
+              if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
+              if (event.key === "Enter" && newValue.trim()) {
+                event.preventDefault();
+                void addRule();
+              }
+            }}
+          />
+          <Dropdown
+            aria-label={text("新规则出口", "New rule egress")} value={outboundLabel(newOutbound)}
+            selectedOptions={[newOutbound]}
+            onOptionSelect={(_, data) => data.optionValue && setNewOutbound(data.optionValue)}
+          >
+            {(outbounds ?? []).map((outbound) => (
+              <Option key={outbound.id} value={outbound.id}>{outboundLabel(outbound.id)}</Option>
+            ))}
+          </Dropdown>
+          <Button appearance="primary" icon={<Add20Regular />} disabled={!newValue.trim()} onClick={() => void addRule()}>
+            {t("routing_add")}
+          </Button>
+          <Button icon={<Add20Regular />} onClick={openBatch}>
+            {text("批量添加", "Batch add")}
+          </Button>
+          {activeType === "process" && (
+            <Button className="routing-process-button" icon={<AppsList20Regular />} onClick={() => void openProcesses()}>{t("routing_select_process")}</Button>
+          )}
+        </div>
+        {probePending && (
+          <p className="routing-normalized-hint" role="status">
+            {text("正在试探哪条线能到你填的地址…", "Testing which line can reach that address…")}
+          </p>
+        )}
+        {lastProbe && !probePending && (
+          <p className="routing-normalized-hint routing-probe-hint" role="status">
+            {text("线路探测：", "Route probe: ")}
+            {(lastProbe.hops ?? [])
+              .map((hop) => `${hop.adapter_name} ${hop.ok ? `${hop.latency_ms}ms` : text("不通", "no path")}`)
+              .join(" · ")}
+            {lastProbe.recommended_name
+              ? text(`　→ 建议走 ${lastProbe.recommended_name}`, ` — use ${lastProbe.recommended_name}`)
+              : text("　→ 没有线路能到达", " — no line reached it")}
+          </p>
+        )}
+        {pasteIntent && (
+          <p className="routing-normalized-hint" role="status">
+            {pasteIntent.reassigned
+              ? text(
+                `这是${matchLabels[pasteIntent.kind]}，会保存为 “${pasteIntent.value}”`,
+                `That reads as a ${matchLabels[pasteIntent.kind]}; it will be saved as “${pasteIntent.value}”`,
+              )
+              : text(
+                `将保存为 “${pasteIntent.value}”`,
+                `Will be saved as “${pasteIntent.value}”`,
+              )}
+          </p>
+        )}
+        <Toolbar className="routing-actions" aria-label={text("规则操作", "Rule actions")}>
+          <SearchBox aria-label={text("筛选当前类型规则", "Filter current rules")} value={filter} placeholder={text("筛选当前类型", "Filter current type")} onChange={(_, data) => setFilter(data.value)} />
+          <span>{text(`${activeRules.length} 条显示 · ${rules.length} 条总计`, `${activeRules.length} shown · ${rules.length} total`)}</span>
+          <div className="routing-action-buttons">
+          <ToolbarButton disabled={loading || checkingOutbounds} onClick={() => void disableUnavailableRules()}>{text(checkingOutbounds ? "正在检查出口…" : "一键禁用无效规则", checkingOutbounds ? "Checking egress…" : "Disable unavailable rules")}</ToolbarButton>
+          <ToolbarButton icon={<Delete20Regular />} disabled={selected.size === 0} onClick={() => setDeleteOpen(true)}>
+            {text(`删除选中 (${selected.size})`, `Delete selected (${selected.size})`)}
+          </ToolbarButton>
+          <ToolbarButton icon={<ArrowDownload20Regular />} onClick={() => void importRules()}>{text("导入备份", "Import backup")}</ToolbarButton>
+          <ToolbarButton icon={<ArrowUpload20Regular />} onClick={() => void appServices.routing.exportRules(
+            rules.map(serializeRule), orderRef.current.split(","),
+          ).then((path) => path && notify(text("导出完成", "Export complete"), path, "success")).catch((error) =>
+            notify(text("导出失败", "Export failed"), error instanceof Error ? error.message : String(error), "error"))}>
+            {text("导出 / 分享", "Export / Share")}
+          </ToolbarButton>
+          </div>
+        </Toolbar>
+      </GlassSurface>
+
+      <GlassSurface className={`routing-grid-surface${loading || activeRules.length === 0 ? " is-empty" : ""}`}>
+        {loading ? (
+          <div key="routing-loading" className="routing-empty motion-state-content"><Spinner label={text("正在读取真实规则配置", "Loading routing configuration")} /></div>
+        ) : activeRules.length === 0 ? (
+          <div key={`routing-empty-${activeType}-${filter ? "filtered" : "plain"}`} className="routing-empty motion-state-content">
+            <strong>{filter
+              ? text("没有匹配筛选条件的规则", "No rules match the filter")
+              : text(`尚未添加${matchLabels[activeType]}`, `No ${matchLabels[activeType]} have been added`)}</strong>
+            <span>{filter
+              ? text("清除筛选后查看全部规则。", "Clear the filter to see every rule.")
+              : text(`使用上方输入框添加第一条规则，${placeholders[activeType]}。`, `Use the field above to add the first rule. ${placeholders[activeType]}.`)}</span>
+            {!filter && (
+              <Button
+                appearance="primary"
+                icon={<Add20Regular />}
+                onClick={() => addRuleInputRef.current?.focus()}
+              >
+                {text("添加第一条规则", "Add first rule")}
+              </Button>
+            )}
+          </div>
+        ) : (
+          <DataGrid
+            className="routing-grid"
+            items={activeRules}
+            columns={columns}
+            getRowId={(item) => item.id}
+            selectionMode="multiselect"
+            selectedItems={selected}
+            onSelectionChange={(event, data) => {
+              // DataGrid also selects on row clicks; only accept checkbox interactions.
+              if (event.target instanceof Element && event.target.closest(`.${checkboxClassNames.root}`)) {
+                setSelected(data.selectedItems);
+              }
+            }}
+            sortable={false}
+
+          >
+            <DataGridHeader>
+              <DataGridRow className="routing-grid-header" selectionCell={{ checkboxIndicator: { "aria-label": text("全选当前规则", "Select all current rules") } }}>
+                {({ renderHeaderCell }) => <DataGridHeaderCell>{renderHeaderCell()}</DataGridHeaderCell>}
+              </DataGridRow>
+            </DataGridHeader>
+            <DataGridBody<DraftRule>>
+              {({ item, rowId }) => (
+                <DataGridRow<DraftRule>
+                  key={rowId}
+                  className={`routing-row${selected.has(rowId) ? " is-selected" : ""}${item.error ? " has-error" : ""}${item.disabled ? " is-disabled" : ""}`}
+                  selectionCell={{ checkboxIndicator: { "aria-label": text(`选择 ${item.value}`, `Select ${item.value}`) } }}
+                >
+                  {({ renderCell, columnId }) => (
+                    // Control cells hand focus straight to their labelled switch, input or dropdown.
+                    <DataGridCell focusMode={columnId === "status" ? "cell" : "none"}>{renderCell(item)}</DataGridCell>
+                  )}
+                </DataGridRow>
+              )}
+            </DataGridBody>
+          </DataGrid>
+        )}
+      </GlassSurface>
+
+      </> : <RuleSetsPanel preview={import.meta.env.DEV && !isDesktopRuntime()} onChanged={() => {
+        void appServices.routing.snapshot().then((snapshot) => {
+          setRestartRequirement({ required: snapshot.restart_required, reason: snapshot.restart_reason ?? "" });
+        }).catch((error) => notify(text("无法刷新生效状态", "Unable to refresh apply status"), String(error), "warning"));
+      }} outbounds={(outbounds ?? []).map((outbound) => ({ id: outbound.id, label: outboundLabel(outbound.id) }))} />}
+
+      <Dialog open={deleteOpen} onOpenChange={(_, data) => setDeleteOpen(data.open)}>
+        <DialogSurface>
+          <DialogBody>
+            <DialogTitle>{text("删除选中的规则？", "Delete selected rules?")}</DialogTitle>
+            <DialogContent>{text(
+              `将删除 ${selected.size} 条规则。保存后不能从当前列表恢复。`,
+              `${selected.size} rules will be deleted and cannot be restored from this list after saving.`,
+            )}</DialogContent>
+            <DialogActions>
+              <Button appearance="secondary" onClick={() => setDeleteOpen(false)}>{t("routing_dialog_cancel")}</Button>
+              <Button appearance="primary" onClick={() => {
+                selected.forEach((id) => {
+                  const timer = validationTimers.current.get(String(id));
+                  if (timer !== undefined) window.clearTimeout(timer);
+                  validationTimers.current.delete(String(id));
+                });
+                applyRules(rulesRef.current.filter((rule) => !selected.has(rule.id)).map((rule) => ({ ...rule, dirty: true })), true);
+                setSelected(new Set());
+                setDeleteOpen(false);
+              }}>{text("确认删除", "Delete")}</Button>
+            </DialogActions>
+          </DialogBody>
+        </DialogSurface>
+      </Dialog>
+
+      <Dialog open={processOpen} onOpenChange={(_, data) => setProcessOpen(data.open)}>
+        <DialogSurface className="process-dialog">
+          <DialogBody>
+            <DialogTitle>{t("routing_process_dialog_title")}</DialogTitle>
+            <DialogContent>
+              <SearchBox aria-label={text("搜索运行中进程", "Search running processes")} autoFocus value={processSearch} placeholder={t("routing_process_search_placeholder")} onChange={(_, data) => setProcessSearch(data.value)} />
+              <div className="process-list">
+                {processLoading ? <Spinner label={t("routing_process_loading")} /> : filteredProcesses.length === 0
+                  ? <span>{t("routing_process_empty")}</span>
+                  : filteredProcesses.map((process) => (
+                    <button key={process.name} onDoubleClick={() => {
+                      setActiveType("process");
+                      setProcessOpen(false);
+                      void addRule(process.name, "process");
+                    }} onClick={() => setNewValue(process.name)} className={newValue === process.name ? "is-selected" : ""}>
+                      <span className="process-icon" aria-hidden="true">
+                        {process.icon
+                          ? <img src={process.icon} alt="" />
+                          : <AppGeneric20Regular />}
+                      </span>
+                      <span className="process-name">{process.name}</span>
+                    </button>
+                  ))}
+              </div>
+            </DialogContent>
+            <DialogActions>
+              <Button onClick={() => setProcessOpen(false)}>{t("routing_dialog_cancel")}</Button>
+              <Button appearance="primary" disabled={!newValue} onClick={() => {
+                setActiveType("process");
+                setProcessOpen(false);
+                void addRule(newValue, "process");
+              }}>{text("添加进程规则", "Add process rule")}</Button>
+            </DialogActions>
+          </DialogBody>
+        </DialogSurface>
+      </Dialog>
+
+      <Dialog open={batchOpen} onOpenChange={(_, data) => !batchApplying && setBatchOpen(data.open)}>
+        <DialogSurface className="routing-batch-dialog glass-surface" data-tone="primary">
+          <DialogBody>
+            <DialogTitle className="routing-batch-title">{text("批量添加分流规则", "Batch add routing rules")}</DialogTitle>
+            <DialogContent>
+              <div className="routing-batch-intro">
+                <span>{batchType === "process"
+                  ? text("每行输入一个进程名，名称中的空格与标点会完整保留。", "Enter one process per line; spaces and punctuation are preserved.")
+                  : text("每行输入一项，也支持逗号、分号或空格分隔。", "Enter one value per line, or separate values with commas, semicolons, or spaces.")}</span>
+              </div>
+              <div className="routing-batch-controls">
+                <label>
+                  <span>{text("规则类型", "Rule type")}</span>
+                  <Dropdown
+                    value={matchLabels[batchType]}
+                    selectedOptions={[batchType]}
+                    onOptionSelect={(_, data) => {
+                      if (!data.optionValue) return;
+                      setBatchType(data.optionValue as MatchType);
+                      setBatchPreview(null);
+                    }}
+                  >
+                    {(Object.keys(matchLabels) as MatchType[]).map((type) => (
+                      <Option key={type} value={type}>{matchLabels[type]}</Option>
+                    ))}
+                  </Dropdown>
+                </label>
+                <label>
+                  <span>{text("出口策略", "Egress policy")}</span>
+                  <Dropdown
+                    value={outboundLabel(batchOutbound)}
+                    selectedOptions={[batchOutbound]}
+                    onOptionSelect={(_, data) => {
+                      if (!data.optionValue) return;
+                      setBatchOutbound(data.optionValue);
+                      setBatchPreview(null);
+                    }}
+                  >
+                    {(outbounds ?? []).map((outbound) => (
+                      <Option key={outbound.id} value={outbound.id}>{outboundLabel(outbound.id)}</Option>
+                    ))}
+                  </Dropdown>
+                </label>
+              </div>
+              <label className="routing-batch-editor">
+                <span className="routing-batch-editor-heading">
+                  <span>{text("匹配值", "Match values")}</span>
+                  <small className={batchValueCount > ROUTING_BATCH_MAX_VALUES ? "is-over-limit" : ""}>{text(
+                    `已识别 ${batchValueCount} 项`,
+                    `${batchValueCount} ${batchValueCount === 1 ? "value" : "values"}`,
+                  )}</small>
+                </span>
+                <Textarea
+                  autoFocus
+                  resize="vertical"
+                  value={batchText}
+                  placeholder={batchType === "domain"
+                    ? "example.com\ncdn.example.com"
+                    : batchType === "ip"
+                      ? "192.0.2.10\n198.51.100.0/24"
+                      : "browser.exe\ngame.exe"}
+                  onChange={(_, data) => {
+                    setBatchText(data.value);
+                    setBatchPreview(null);
+                  }}
+                />
+                <small className="routing-batch-helper">{batchType === "process"
+                  ? text("进程名中的空格和标点会保留；请使用换行或 Tab 分隔。", "Spaces and punctuation in process names are preserved; use line breaks or tabs as separators.")
+                  : text("域名和 IP 也可使用空格或 Tab 分隔；单次最多 2000 条。", "Domains and IPs may also be separated by spaces or tabs; up to 2,000 values per batch.")}</small>
+              </label>
+              {batchPreview && (
+                <div className="routing-batch-preview">
+                  <div className="routing-batch-summary">
+                    <Badge appearance="tint" color="success">{text(`新增 ${batchPreview.add_count}`, `${batchPreview.add_count} new`)}</Badge>
+                    <Badge appearance="tint" color="informative">{text(`重复 ${batchPreview.duplicate_count}`, `${batchPreview.duplicate_count} duplicates`)}</Badge>
+                    <Badge appearance="tint" color="warning">{text(`冲突 ${batchPreview.conflict_count}`, `${batchPreview.conflict_count} conflicts`)}</Badge>
+                    <Badge appearance="tint" color={batchPreview.invalid_count > 0 ? "danger" : "subtle"}>{text(`无效 ${batchPreview.invalid_count}`, `${batchPreview.invalid_count} invalid`)}</Badge>
+                  </div>
+                  {batchPreview.conflict_count > 0 && (
+                    <Checkbox
+                      checked={replaceBatchConflicts}
+                      onChange={(_, data) => setReplaceBatchConflicts(Boolean(data.checked))}
+                      label={text("将冲突规则更新为本次选择的出口", "Update conflicting rules to the selected egress")}
+                    />
+                  )}
+                  {batchPreview.invalid_count > 0 && (
+                    <MessageBar intent="error">
+                      <MessageBarBody>{text("请修正无效项后重新检查，当前不会保存任何更改。", "Fix invalid values and check again; no changes will be saved yet.")}</MessageBarBody>
+                    </MessageBar>
+                  )}
+                  {(batchPreview.items ?? []).some((item) => item.status === "invalid" || item.status === "conflict") && (
+                    <div className="routing-batch-issues">
+                      {(batchPreview.items ?? [])
+                        .filter((item) => item.status === "invalid" || item.status === "conflict")
+                        .slice(0, 40)
+                        .map((item, index) => (
+                          <div key={`${item.status}-${item.input}-${index}`} className={`routing-batch-issue is-${item.status}`}>
+                            <strong>{item.input}</strong>
+                            <span>{item.status === "conflict"
+                              ? text(`当前出口：${outboundLabel(item.existing_outbound || "")}`, `Current egress: ${outboundLabel(item.existing_outbound || "")}`)
+                              : item.message}</span>
+                          </div>
+                        ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </DialogContent>
+            <DialogActions className="routing-batch-actions">
+              <Button disabled={batchApplying} onClick={() => setBatchOpen(false)}>{t("routing_dialog_cancel")}</Button>
+              {batchPreview ? (
+                <Button
+                  appearance="primary"
+                  disabledFocusable={batchPreview.invalid_count > 0 || batchApplying || (batchPreview.add_count === 0 && (!replaceBatchConflicts || batchPreview.conflict_count === 0))}
+                  disabled={batchPreview.invalid_count > 0 || batchApplying || (batchPreview.add_count === 0 && (!replaceBatchConflicts || batchPreview.conflict_count === 0))}
+                  icon={batchApplying ? <Spinner size="tiny" /> : <Add20Regular />}
+                  onClick={() => void confirmBatch()}
+                >{text(
+                    `添加 ${batchPreview.add_count + (replaceBatchConflicts ? batchPreview.conflict_count : 0)} 条规则`,
+                    `Add ${batchPreview.add_count + (replaceBatchConflicts ? batchPreview.conflict_count : 0)} rules`,
+                  )}</Button>
+              ) : (
+                <Button
+                  appearance="primary"
+                  disabledFocusable={batchChecking || batchApplying || !batchText.trim()}
+                  disabled={batchChecking || batchApplying || !batchText.trim()}
+                  icon={batchChecking ? <Spinner size="tiny" /> : <CheckmarkCircle16Regular />}
+                  onClick={() => void previewBatch()}
+                >{text(batchValueCount > 0 ? `预览 ${batchValueCount} 条` : "检查并预览", batchValueCount > 0 ? `Preview ${batchValueCount}` : "Check and preview")}</Button>
+              )}
+            </DialogActions>
+          </DialogBody>
+        </DialogSurface>
+      </Dialog>
+
+      <Dialog open={importPreviewOpen} onOpenChange={(_, data) => !data.open && setImportPreviewOpen(false)}>
+        <DialogSurface>
+          <DialogBody>
+            <DialogTitle>{text("替换当前分流规则？", "Replace current routing rules?")}</DialogTitle>
+            <DialogContent>
+              {text(
+                `文件已通过格式、版本和全部规则校验。确认后将用 ${importPreview?.rules?.length ?? 0} 条规则原子替换当前 ${rules.length} 条规则。`,
+                `The file passed format, version, and rule validation. Confirm to atomically replace the current ${rules.length} rules with ${importPreview?.rules?.length ?? 0} imported rules.`,
+              )}
+            </DialogContent>
+            <DialogActions>
+              <Button onClick={() => setImportPreviewOpen(false)}>{t("routing_dialog_cancel")}</Button>
+              <Button appearance="primary" onClick={() => void confirmImport()}>{text("确认导入", "Import and replace")}</Button>
+            </DialogActions>
+          </DialogBody>
+        </DialogSurface>
+      </Dialog>
+    </main>
+  );
+}

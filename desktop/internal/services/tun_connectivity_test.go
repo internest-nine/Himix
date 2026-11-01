@@ -1,0 +1,489 @@
+package services
+
+import (
+	"bufio"
+	"context"
+	"encoding/binary"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+func TestAggregationAlternativesResolveAllDomainsAndTryBackupIP(t *testing.T) {
+	stubTUNDataPathProbe(t, true)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.Host, "backup.example:") {
+			t.Errorf("lost Host: %s", r.Host)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	original := tunConnectivityURLs
+	tunConnectivityURLs = []string{"http://failed.example/", strings.Replace(server.URL, "127.0.0.1", "backup.example", 1)}
+	t.Cleanup(func() { tunConnectivityURLs = original })
+	resolver := func(ctx context.Context, domain, adapter string) (dnsResolveResult, error) {
+		if adapter != "Ethernet" {
+			t.Errorf("unexpected adapter %q", adapter)
+		}
+		if domain == "failed.example" {
+			return dnsResolveResult{}, errors.New("DNS unavailable")
+		}
+		return dnsResolveResult{Domain: domain, Address: "127.0.0.2", Addresses: []string{"127.0.0.2", "127.0.0.1"}}, nil
+	}
+	report, err := probeTUNConnectivityThroughChannels(context.Background(), startTestSOCKS5(t),
+		dnsResolveResult{Adapter: "Ethernet", Transport: "udp", Server: startTestDNSUDP(t)}, resolver)
+	if err != nil || report.Checks[1].OK || !report.Checks[2].OK {
+		t.Fatalf("backup should pass: %#v %v", report, err)
+	}
+	if !strings.Contains(report.Checks[2].Detail, "127.0.0.2") || !strings.Contains(report.Checks[2].Detail, "127.0.0.1") {
+		t.Fatalf("missing per-IP evidence: %s", report.Checks[2].Detail)
+	}
+}
+
+func TestAggregationAlternativesRejectFakeIPAndRefreshResolution(t *testing.T) {
+	calls := 0
+	resolver := func(context.Context, string, string) (dnsResolveResult, error) {
+		calls++
+		return dnsResolveResult{Address: "198.18.0.1", Addresses: []string{"198.19.1.1", "invalid"}}, nil
+	}
+	for i := 0; i < 2; i++ {
+		check := probeAggregationAlternatives(context.Background(), "https://backup.example/", "invalid", dnsResolveResult{}, resolver)
+		if check.OK || !strings.Contains(check.Error, "no usable literal") {
+			t.Fatalf("unsafe DNS answer accepted: %#v", check)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("DNS was pinned instead of refreshed: %d", calls)
+	}
+}
+
+func TestConnectivityBootstrapFallsBackToSecondDomain(t *testing.T) {
+	calls := 0
+	result, err := resolveConnectivityBootstrap(context.Background(), "Ethernet", func(_ context.Context, domain, adapter string) (dnsResolveResult, error) {
+		calls++
+		if calls == 1 {
+			return dnsResolveResult{}, errors.New("first DNS target failed")
+		}
+		return dnsResolveResult{Domain: domain, Adapter: adapter, Address: "192.0.2.1"}, nil
+	})
+	if err != nil || calls != 2 || result.Domain != "www.baidu.com" {
+		t.Fatalf("fallback result=%#v calls=%d err=%v", result, calls, err)
+	}
+}
+
+func TestProbeTUNConnectivityAcceptsRealHTTPResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	original := tunConnectivityURLs
+	tunConnectivityURLs = []string{server.URL}
+	t.Cleanup(func() { tunConnectivityURLs = original })
+
+	detail, err := probeTUNConnectivity(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail == "" {
+		t.Fatal("expected connectivity evidence")
+	}
+}
+
+func TestProbeTUNConnectivityRejectsUnavailableEndpoints(t *testing.T) {
+	original := tunConnectivityURLs
+	tunConnectivityURLs = []string{"http://127.0.0.1:1/"}
+	t.Cleanup(func() { tunConnectivityURLs = original })
+	if _, err := probeTUNConnectivity(context.Background()); err == nil {
+		t.Fatal("expected failed connectivity probe")
+	}
+}
+
+func TestProbeTUNConnectivityReportsEveryEndpointFailure(t *testing.T) {
+	original := tunConnectivityURLs
+	tunConnectivityURLs = []string{
+		"http://127.0.0.1:1/first",
+		"http://127.0.0.1:2/second",
+	}
+	t.Cleanup(func() { tunConnectivityURLs = original })
+	_, err := probeTUNConnectivity(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "/first") || !strings.Contains(err.Error(), "/second") {
+		t.Fatalf("connectivity error did not retain all endpoints: %v", err)
+	}
+}
+
+func TestProbeTUNConnectivityAllowsAnyHTTPAlternative(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	failedEndpoint := closedTestHTTPURL(t)
+	original := tunConnectivityURLs
+	tunConnectivityURLs = []string{failedEndpoint, server.URL}
+	t.Cleanup(func() { tunConnectivityURLs = original })
+
+	detail, err := probeTUNConnectivity(context.Background())
+	if err != nil {
+		t.Fatalf("one successful system-direct endpoint should pass: %v", err)
+	}
+	if !strings.Contains(detail, failedEndpoint) || !strings.Contains(detail, "ok=true") {
+		t.Fatalf("connectivity summary lost alternative endpoint evidence: %s", detail)
+	}
+}
+
+func TestChannelConnectivitySeparatesDNSBootstrapAndAggregation(t *testing.T) {
+	stubTUNDataPathProbe(t, true)
+	original := tunConnectivityURLs
+	tunConnectivityURLs = []string{"http://127.0.0.1:1/aggregation"}
+	t.Cleanup(func() { tunConnectivityURLs = original })
+	report, err := probeTUNConnectivityThroughChannels(
+		context.Background(), "not-a-socks-endpoint",
+		dnsResolveResult{Transport: "udp", Server: "not-a-literal-dns-endpoint"},
+	)
+	if err == nil {
+		t.Fatal("expected both channel checks to fail")
+	}
+	if len(report.Checks) != 3 {
+		t.Fatalf("checks = %#v", report.Checks)
+	}
+	if report.Checks[0].Stage != "dns_bootstrap" || report.Checks[0].Outbound != "system-direct" {
+		t.Fatalf("DNS bootstrap check = %#v", report.Checks[0])
+	}
+	if report.Checks[1].Stage != "aggregation_data" || report.Checks[1].Outbound != "aggregation" {
+		t.Fatalf("aggregation check = %#v", report.Checks[1])
+	}
+	if report.Checks[2].Stage != "tun_data_path" || report.Checks[2].Outbound != "windows-tun" {
+		t.Fatalf("TUN data-path check = %#v", report.Checks[2])
+	}
+	if !strings.Contains(err.Error(), "dns_bootstrap") || !strings.Contains(err.Error(), "aggregation_data") {
+		t.Fatalf("combined error lost stage context: %v", err)
+	}
+}
+
+func TestChannelConnectivityAllowsAnyAggregationHTTPAlternative(t *testing.T) {
+	stubTUNDataPathProbe(t, true)
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	socksEndpoint := startTestSOCKS5(t)
+	dnsEndpoint := startTestDNSUDP(t)
+	failedEndpoint := closedTestHTTPURL(t)
+	original := tunConnectivityURLs
+	tunConnectivityURLs = []string{failedEndpoint, server.URL}
+	t.Cleanup(func() { tunConnectivityURLs = original })
+
+	report, err := probeTUNConnectivityThroughChannels(
+		context.Background(), socksEndpoint,
+		dnsResolveResult{Transport: "udp", Server: dnsEndpoint},
+	)
+	if err != nil {
+		t.Fatalf("one successful aggregation endpoint should pass: %v", err)
+	}
+	if len(report.Checks) != 4 || !report.Checks[0].OK || report.Checks[1].OK ||
+		!report.Checks[2].OK || !report.Checks[3].OK {
+		t.Fatalf("unexpected alternative endpoint report: %#v", report.Checks)
+	}
+	if !strings.Contains(report.summary(), failedEndpoint) {
+		t.Fatalf("failed alternative endpoint was not retained: %s", report.summary())
+	}
+}
+
+func TestChannelConnectivityRequiresDNSBootstrapEvenWhenHTTPWorks(t *testing.T) {
+	stubTUNDataPathProbe(t, true)
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	socksEndpoint := startTestSOCKS5(t)
+	original := tunConnectivityURLs
+	tunConnectivityURLs = []string{server.URL}
+	t.Cleanup(func() { tunConnectivityURLs = original })
+
+	report, err := probeTUNConnectivityThroughChannels(
+		context.Background(), socksEndpoint,
+		dnsResolveResult{Transport: "udp", Server: "not-a-literal-dns-endpoint"},
+	)
+	if err == nil || report.Checks[0].OK || !report.Checks[1].OK {
+		t.Fatalf("DNS bootstrap must be required: report=%#v err=%v", report.Checks, err)
+	}
+	if !strings.Contains(err.Error(), "dns_bootstrap") {
+		t.Fatalf("DNS bootstrap failure lost stage context: %v", err)
+	}
+}
+
+func TestChannelConnectivityReportsAllFailedAggregationEndpoints(t *testing.T) {
+	stubTUNDataPathProbe(t, true)
+	socksEndpoint := startTestSOCKS5(t)
+	dnsEndpoint := startTestDNSUDP(t)
+	first := closedTestHTTPURL(t)
+	second := closedTestHTTPURL(t)
+	original := tunConnectivityURLs
+	tunConnectivityURLs = []string{first, second}
+	t.Cleanup(func() { tunConnectivityURLs = original })
+
+	report, err := probeTUNConnectivityThroughChannels(
+		context.Background(), socksEndpoint,
+		dnsResolveResult{Transport: "udp", Server: dnsEndpoint},
+	)
+	if err == nil || !report.Checks[0].OK {
+		t.Fatalf("all aggregation endpoints should fail: report=%#v err=%v", report.Checks, err)
+	}
+	if !strings.Contains(err.Error(), first) || !strings.Contains(err.Error(), second) {
+		t.Fatalf("aggregation failure lost an endpoint: %v", err)
+	}
+}
+
+func TestChannelConnectivityRequiresRealTunDataPath(t *testing.T) {
+	stubTUNDataPathProbe(t, false)
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	socksEndpoint := startTestSOCKS5(t)
+	dnsEndpoint := startTestDNSUDP(t)
+	original := tunConnectivityURLs
+	tunConnectivityURLs = []string{server.URL}
+	t.Cleanup(func() { tunConnectivityURLs = original })
+
+	report, err := probeTUNConnectivityThroughChannels(
+		context.Background(), socksEndpoint,
+		dnsResolveResult{Transport: "udp", Server: dnsEndpoint},
+	)
+	if err == nil || len(report.Checks) != 3 || !report.Checks[0].OK ||
+		!report.Checks[1].OK || report.Checks[2].OK {
+		t.Fatalf("real TUN path must be required: report=%#v err=%v", report.Checks, err)
+	}
+	if !strings.Contains(err.Error(), "tun_data_path") {
+		t.Fatalf("TUN data-path failure lost stage context: %v", err)
+	}
+}
+
+func TestAggregationConnectivityUsesSOCKSDataChannel(t *testing.T) {
+	hosts := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		hosts <- request.Host
+		response.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	socksEndpoint := startTestSOCKS5(t)
+	endpoint := strings.Replace(server.URL, "127.0.0.1", "localhost", 1)
+	requestEndpoint, originalHost, supported, err := resolveAggregationTarget(
+		endpoint,
+		dnsResolveResult{Domain: "localhost", Address: "127.0.0.1"},
+	)
+	if err != nil || !supported {
+		t.Fatalf("resolve aggregation target: supported=%t err=%v", supported, err)
+	}
+	check := probeHTTPURLTarget(
+		context.Background(), endpoint, requestEndpoint, originalHost, &socksEndpoint, "aggregation",
+	)
+	if !check.OK || check.Outbound != "aggregation" {
+		t.Fatalf("aggregation SOCKS check = %#v", check)
+	}
+	if host := <-hosts; !strings.HasPrefix(host, "localhost:") {
+		t.Fatalf("aggregation probe lost original HTTP Host header: %q", host)
+	}
+}
+
+func TestResolveAggregationTargetUsesPreTUNDNSAddress(t *testing.T) {
+	endpoint := "http://www.msftconnecttest.com/connecttest.txt"
+	requestEndpoint, originalHost, supported, err := resolveAggregationTarget(
+		endpoint,
+		dnsResolveResult{Domain: "www.msftconnecttest.com", Address: "47.88.58.234"},
+	)
+	if err != nil || !supported {
+		t.Fatalf("resolve aggregation target: supported=%t err=%v", supported, err)
+	}
+	if requestEndpoint != "http://47.88.58.234/connecttest.txt" {
+		t.Fatalf("request endpoint = %q", requestEndpoint)
+	}
+	if originalHost != "www.msftconnecttest.com" {
+		t.Fatalf("original host = %q", originalHost)
+	}
+}
+
+func TestResolveAggregationTargetSkipsUnrelatedPreTUNDNSResult(t *testing.T) {
+	requestEndpoint, originalHost, supported, err := resolveAggregationTarget(
+		"https://www.baidu.com/",
+		dnsResolveResult{Domain: "www.msftconnecttest.com", Address: "47.88.58.234"},
+	)
+	if err != nil || supported || requestEndpoint != "" || originalHost != "" {
+		t.Fatalf(
+			"unrelated target must be skipped: endpoint=%q host=%q supported=%t err=%v",
+			requestEndpoint, originalHost, supported, err,
+		)
+	}
+}
+
+func startTestSOCKS5(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go serveTestSOCKS5(connection)
+		}
+	}()
+	return listener.Addr().String()
+}
+
+func startTestDNSUDP(t *testing.T) string {
+	t.Helper()
+	listener, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		query := make([]byte, 4096)
+		count, address, readErr := listener.ReadFromUDP(query)
+		if readErr != nil || count < 2 {
+			return
+		}
+		response := make([]byte, 12)
+		response[0], response[1] = query[0], query[1]
+		response[2], response[3] = 0x81, 0x80
+		response[4], response[5] = 0, 1
+		_, _ = listener.WriteToUDP(response, address)
+	}()
+	return listener.LocalAddr().String()
+}
+
+func closedTestHTTPURL(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	_ = listener.Close()
+	return "http://" + address + "/failed"
+}
+
+func serveTestSOCKS5(connection net.Conn) {
+	defer connection.Close()
+	reader := bufio.NewReader(connection)
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(reader, header); err != nil || header[0] != 5 {
+		return
+	}
+	methods := make([]byte, int(header[1]))
+	if _, err := io.ReadFull(reader, methods); err != nil {
+		return
+	}
+	if _, err := connection.Write([]byte{5, 0}); err != nil {
+		return
+	}
+	request := make([]byte, 4)
+	if _, err := io.ReadFull(reader, request); err != nil || request[0] != 5 || request[1] != 1 {
+		return
+	}
+	var host string
+	switch request[3] {
+	case 1:
+		address := make([]byte, 4)
+		if _, err := io.ReadFull(reader, address); err != nil {
+			return
+		}
+		host = net.IP(address).String()
+	case 3:
+		length, err := reader.ReadByte()
+		if err != nil {
+			return
+		}
+		address := make([]byte, int(length))
+		if _, err := io.ReadFull(reader, address); err != nil {
+			return
+		}
+		host = string(address)
+	case 4:
+		address := make([]byte, 16)
+		if _, err := io.ReadFull(reader, address); err != nil {
+			return
+		}
+		host = net.IP(address).String()
+	default:
+		return
+	}
+	portBytes := make([]byte, 2)
+	if _, err := io.ReadFull(reader, portBytes); err != nil {
+		return
+	}
+	target, err := net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(int(binary.BigEndian.Uint16(portBytes)))))
+	if err != nil {
+		_, _ = connection.Write([]byte{5, 5, 0, 1, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	defer target.Close()
+	local := target.LocalAddr().(*net.TCPAddr)
+	reply := []byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}
+	copy(reply[4:8], local.IP.To4())
+	binary.BigEndian.PutUint16(reply[8:], uint16(local.Port))
+	if _, err := connection.Write(reply); err != nil {
+		return
+	}
+	done := make(chan struct{}, 2)
+	go func() { _, _ = io.Copy(target, reader); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(connection, target); done <- struct{}{} }()
+	<-done
+}
+
+func stubTUNDataPathProbe(t *testing.T, ok bool) {
+	t.Helper()
+	original := tunDataPathProbe
+	tunDataPathProbe = func(context.Context) tunConnectivityCheck {
+		check := tunConnectivityCheck{
+			Stage:    "tun_data_path",
+			Endpoint: tunDataPathURL,
+			Outbound: "windows-tun",
+			OK:       ok,
+		}
+		if ok {
+			check.Detail = "synthetic TUN path ready"
+		} else {
+			check.Error = "synthetic TUN path unavailable"
+		}
+		return check
+	}
+	t.Cleanup(func() { tunDataPathProbe = original })
+}
+
+func TestRejectDefaultOutboundDiscountsOnlyTUNDataPath(t *testing.T) {
+	failing := tunConnectivityReport{Checks: []tunConnectivityCheck{
+		{Stage: "dns_bootstrap", OK: true},
+		{Stage: "aggregation_data", OK: true},
+		{Stage: "tun_data_path", Error: "curl: connection refused"},
+	}}
+	if _, err := discountRejectedTUNDataPath(failing, failing.failure(), "aggregation"); err == nil {
+		t.Fatal("a data-path failure must still be reported when unmatched traffic is not rejected")
+	}
+	report, err := discountRejectedTUNDataPath(failing, failing.failure(), OutboundReject)
+	if err != nil {
+		t.Fatalf("global reject made the expected data-path refusal a connectivity failure: %v", err)
+	}
+	if check := report.Checks[2]; !check.OK || check.Error != "" || check.Detail == "" {
+		t.Fatalf("data-path check was not marked as skipped: %+v", check)
+	}
+	if failing.Checks[2].OK {
+		t.Fatal("the original report was mutated")
+	}
+	broken := tunConnectivityReport{Checks: []tunConnectivityCheck{
+		{Stage: "aggregation_data", Error: "socks unreachable"},
+		{Stage: "tun_data_path", Error: "curl: connection refused"},
+	}}
+	if _, err := discountRejectedTUNDataPath(broken, broken.failure(), OutboundReject); err == nil {
+		t.Fatal("global reject must not hide a broken aggregation channel")
+	}
+}

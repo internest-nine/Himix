@@ -1,0 +1,183 @@
+:root {
+  --hm-panel-opacity: 0.5;
+  --hm-panel-blur: 20px;
+  --hm-panel-saturation: 118%;
+  --hm-border-brightness: 0.52;
+  --hm-shadow-strength: 0.24;
+  --hm-radius: 8px;
+  --hm-bg-overlay: 0.26;
+  --hm-bg-blur: 0px;
+  --hm-bg-brightness: 100%;
+  --hm-bg-saturation: 94%;
+  --hm-bg-contrast: 100%;
+  --hm-bg-scale: cover;
+  --hm-bg-position: center;
+  --hm-gradient-background: linear-gradient(135deg, #cbd8e2 0%, #e9e3da 52%, #c7d9e4 100%);
+  --hm-solid-background: #dce4ea;
+  --hm-card-glow-border: color-mix(in srgb, var(--hm-accent) 62%, transparent);
+  --hm-card-glow-near: color-mix(in srgb, var(--hm-accent) 46%, transparent);
+  --hm-card-glow-far: color-mix(in srgb, var(--hm-accent) 26%, transparent);
+  --hm-card-glow-spot: color-mix(in srgb, var(--hm-accent) 78%, white);
+  --hm-card-glow-rest: color-mix(in srgb, var(--hm-accent) 6%, transparent);
+  --hm-card-glow-edge-opacity: 0.9;
+  --hm-card-glow-halo-opacity: 0.62;
+  --hm-card-glow-radius: 220px;
+  --hm-card-glow-halo-radius: 270px;
+}
+
+[data-appearance="light"] {
+  --hm-window-base: #f5f7fa;
+  --hm-system-background:
+    radial-gradient(circle at 78% 5%, rgba(0, 95, 184, 0.055), transparent 34%),
+    radial-gradient(circle at 14% 92%, rgba(180, 91, 0, 0.035), transparent 38%),
+    linear-gradient(135deg, #fafafa 0%, #f3f3f3 52%, #eeeeee 100%);
+  --hm-window-tint: rgba(255, 255, 255, 0.62);
+  --hm-shell: rgba(250, 250, 250, 0.56);
+  --hm-solid-chrome: #edf1f6;
+  --hm-surface-rgb: 255, 255, 255;
+  --hm-surface-secondary-rgb: 241, 244, 248;
+  --hm-inner-highlight: rgba(255, 255, 255, calc(0.76 * var(--hm-border-brightness)));
+  --hm-outer-border: rgba(38, 57, 83, 0.09);
+  --hm-shadow-colour: 17, 29, 48;
+  --hm-card-glow-spot: color-mix(in srgb, var(--hm-accent) 74%, white);
+  --hm-card-glow-edge-opacity: 0.82;
+  --hm-card-glow-halo-opacity: 0.5;
+}
+
+[data-appearance="light"][data-background-source="local"] {
+  --hm-window-tint: rgba(231, 237, 241, 0.2);
+  --hm-shell: rgba(226, 233, 238, 0.3);
+  --hm-surface-rgb: 247, 249, 250;
+  --hm-surface-secondary-rgb: 239, 243, 246;
+  --hm-inner-highlight: rgba(255, 255, 255, calc(0.72 * var(--hm-border-brightness)));
+  --hm-outer-border: rgba(32, 48, 59, 0.13);
+  --hm-shadow-colour: 25, 40, 51;
+  --hm-card-glow-edge-opacity: 0.94;
+  --hm-card-glow-halo-opacity: 0.66;
+  --hm-local-wallpaper-veil: linear-gradient(105deg, rgba(218, 227, 234, 0.12), rgba(240, 244, 246, 0.03) 48%, rgba(221, 229, 236, 0.08));
+  --hm-local-shell-veil: linear-gradient(110deg, rgba(222, 230, 236, 0.08), rgba(241, 244, 246, 0.02) 52%, rgba(225, 232, 238, 0.05));
+}
+
+[data-appearance="dark"][data-background-source="local"] {
+  --hm-local-wallpaper-veil: linear-gradient(105deg, rgba(18, 23, 28, 0.12), rgba(8, 12, 16, 0.03) 48%, rgba(15, 20, 25, 0.08));
+  --hm-local-shell-veil: linear-gradient(110deg, rgba(22, 28, 33, 0.08), rgba(12, 16, 20, 0.02) 52%, rgba(18, 24, 29, 0.05));
+}
+
+[data-appearance="dark"] {
+  --hm-window-base: #171a21;
+  --hm-system-background:
+    radial-gradient(circle at 82% 4%, rgba(0, 120, 212, 0.075), transparent 34%),
+    radial-gradient(circle at 12% 92%, rgba(116, 85, 195, 0.05), transparent 36%),
+    linear-gradient(140deg, #181818 0%, #202020 52%, #151515 100%);
+  --hm-window-tint: rgba(8, 8, 8, 0.62);
+  --hm-shell: rgba(20, 20, 20, 0.58);
+  --hm-solid-chrome: #1c2029;
+  --hm-surface-rgb: 36, 42, 53;
+  --hm-surface-secondary-rgb: 28, 33, 43;
+  --hm-inner-highlight: rgba(255, 255, 255, calc(0.16 * var(--hm-border-brightness)));
+  --hm-outer-border: rgba(255, 255, 255, 0.083);
+  --hm-shadow-colour: 17, 29, 48;
+  --hm-card-glow-spot: color-mix(in srgb, var(--hm-accent) 80%, white);
+  --hm-card-glow-edge-opacity: 1;
+  --hm-card-glow-halo-opacity: 0.74;
+}
+
+.glass-surface {
+  position: relative;
+  border: 1px solid var(--hm-outer-border);
+  border-radius: var(--hm-radius);
+  background: var(--hm-surface-fill);
+  box-shadow:
+    inset 0 1px 0 var(--hm-inner-highlight),
+    0 2px 5px rgba(var(--hm-shadow-colour), calc(0.1 * var(--hm-shadow-strength))),
+    0 8px 24px rgba(var(--hm-shadow-colour), calc(0.1 * var(--hm-shadow-strength)));
+  backdrop-filter: none;
+}
+
+.network-adapter {
+  backdrop-filter: none;
+}
+
+.glass-surface[data-tone="secondary"] {
+  background: var(--hm-surface-secondary-fill);
+  box-shadow:
+    inset 0 1px 0 var(--hm-inner-highlight),
+    0 8px 24px rgba(var(--hm-shadow-colour), calc(0.12 * var(--hm-shadow-strength)));
+}
+
+:is([data-background-source="local"], [data-background-source="builtin"])[data-panel-material="blur"] .glass-surface,
+:is([data-background-source="local"], [data-background-source="builtin"])[data-panel-material="blur"] .network-adapter {
+  backdrop-filter: blur(var(--hm-panel-blur)) saturate(var(--hm-panel-saturation));
+}
+
+:is([data-background-source="local"], [data-background-source="builtin"])[data-panel-material="solid"] .glass-surface,
+:is([data-background-source="local"], [data-background-source="builtin"])[data-panel-material="solid"] .network-adapter {
+  backdrop-filter: none;
+}
+
+
+[data-appearance="light"]:is([data-background-source="local"], [data-background-source="builtin"])[data-panel-material="blur"] .glass-surface,
+[data-appearance="light"]:is([data-background-source="local"], [data-background-source="builtin"])[data-panel-material="blur"] .network-adapter {
+  backdrop-filter:
+    blur(calc(var(--hm-panel-blur) + 3px))
+    saturate(88%)
+    brightness(1.035);
+}
+
+/* Companion-inspired wallpapers: CSS-only, with matching light and dark palettes. */
+:root, [data-appearance="light"] {
+  --hm-soft-dots: radial-gradient(ellipse at 50% 65%, #c6b3ee80, transparent 75%), radial-gradient(circle, #7784a84d 1px, transparent 1.3px), linear-gradient(145deg, #eef0fb, #f5e9e2);
+}
+[data-appearance="dark"] {
+  --hm-soft-dots: radial-gradient(ellipse at 50% 65%, #8571c640, transparent 75%), radial-gradient(circle, #b4c0df40 1px, transparent 1.3px), linear-gradient(145deg, #222b40, #342a3f);
+}
+
+/* Surface roles: one background field, distinct coverage for content and rows. */
+:root {
+  --hm-content-opacity: var(--hm-panel-opacity);
+  --hm-row-opacity: var(--hm-panel-opacity);
+  --hm-surface-fill: rgba(var(--hm-surface-rgb), var(--hm-content-opacity));
+  --hm-surface-secondary-fill: rgba(var(--hm-surface-secondary-rgb), var(--hm-content-opacity));
+  --hm-row-fill: rgba(var(--hm-surface-rgb), var(--hm-row-opacity));
+  --hm-selected-fill: color-mix(in srgb, var(--hm-accent) 9%, var(--hm-row-fill));
+  /* One selected-card treatment everywhere: this border plus --hm-selected-fill. */
+  --hm-selected-border: color-mix(in srgb, var(--hm-accent) 55%, var(--hm-outer-border));
+}
+[data-background-source="system"], [data-background-source="solid"] {
+  --hm-content-opacity: max(0.9, var(--hm-panel-opacity));
+  --hm-row-opacity: max(0.94, var(--hm-panel-opacity));
+}
+[data-background-source="builtin"], [data-background-source="gradient"] {
+  --hm-content-opacity: var(--hm-panel-opacity);
+  --hm-row-opacity: calc(var(--hm-panel-opacity) * 0.84);
+}
+:root, [data-appearance="light"] {
+  --hm-soft-bloom:
+    radial-gradient(ellipse at 0% 100%, #b8efbc 0%, transparent 62%),
+    radial-gradient(ellipse at 6% 0%, #d0bcfa 0%, transparent 64%),
+    radial-gradient(ellipse at 65% 35%, #e3e2fc 0%, transparent 66%),
+    linear-gradient(120deg, #d8eee9, #f5f6fc 85%);
+}
+[data-appearance="dark"] {
+  --hm-soft-bloom:
+    radial-gradient(ellipse at 0% 100%, #234c43 0%, transparent 62%),
+    radial-gradient(ellipse at 6% 0%, #473969 0%, transparent 64%),
+    radial-gradient(ellipse at 65% 35%, #292c48 0%, transparent 66%),
+    linear-gradient(120deg, #1c3033, #191d29 85%);
+}
+
+/* White is an opaque neutral theme; wallpaper palettes remain independent. */
+[data-appearance="light"][data-material="solid"][data-background-source="system"] {
+  --hm-window-base: #ffffff;
+  --hm-solid-chrome: #fafafa;
+  --hm-surface-secondary-rgb: 248, 248, 248;
+  --hm-content-opacity: 1;
+  --hm-row-opacity: 1;
+  --hm-hero-fill: #ffffff;
+  --hm-outer-border: rgba(0, 0, 0, 0.08);
+  --hm-shadow-colour: 0, 0, 0;
+  --hm-text-primary: #242424;
+  --hm-text-secondary: #4a4a4a;
+  --hm-text-tertiary: #666666;
+  --hm-selected-fill: color-mix(in srgb, var(--hm-accent) 4%, white);
+}

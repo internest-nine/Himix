@@ -1,0 +1,838 @@
+package main
+
+import (
+	"encoding/json"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/internest-nine/Himix/desktop/internal/releaseversion"
+)
+
+func TestInstallerTransactionOrderAndLegacySafety(t *testing.T) {
+	data, err := os.ReadFile("build/windows/nsis/project.nsi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := strings.ReplaceAll(string(data), "\r\n", "\n")
+	start := strings.Index(script, "\nSection\n")
+	end := strings.Index(script, `Section "uninstall"`)
+	if start < 0 || end < start {
+		t.Fatal("missing installer section")
+	}
+	section := script[start:end]
+	previous := -1
+	for _, step := range []string{`Call EnsureWebViewRuntime`, `StrCpy $HimixSetupOperation "begin"`, `Call CloseRunningHimix`, `Call StopCoreServiceForUpgrade`, `Call RecoverPreviousWailsInstallation`, `Call RecoverLegacyV22Network`, `Call RecoverWailsInstallations`, `Call StopCoreProcessesForUpgrade`, `StrCpy $HimixSetupOperation "apply"`, `install-service --desktop`, `--core-service-self-test`, `!insertmacro HimixWriteRegistration`, `StrCpy $HimixSetupOperation "commit"`, `Call RemoveLegacyInstallations`, `Call RemovePreviousWailsInstallation`, `Call RemoveLegacyAutostartTask`, `Call RestoreAutostart`} {
+		at := strings.Index(section, step)
+		if at <= previous {
+			t.Fatalf("unsafe/missing step %q at %d after %d", step, at, previous)
+		}
+		previous = at
+	}
+	for _, required := range []string{`!define UNINST_KEY_NAME "Himix"`, `InstallDir ""`, `Function .onInstFailed`, `!define MUI_CUSTOMFUNCTION_ABORT RollbackSetupTransaction`, `--setup-transaction rollback`, `--setup-transaction recover`, `IfErrors registrationFailed`} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("missing %q", required)
+		}
+	}
+	for _, unsafe := range []string{`Call PrepareProtectedCoreDirectory`, `ExecWait '$0 /S'`, `ExecWait '$0 /VERYSILENT`, `RMDir /r "$PROGRAMFILES64\Himix\Himix"`, `!insertmacro wails.webview2runtime`} {
+		if strings.Contains(script[:end], unsafe) {
+			t.Fatalf("unsafe pre-commit operation remains %q", unsafe)
+		}
+	}
+}
+
+func TestInstallerMigratesRegisteredWailsInstallWhenDirectoryChanges(t *testing.T) {
+	data, err := os.ReadFile("build/windows/nsis/project.nsi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := strings.ReplaceAll(string(data), "\r\n", "\n")
+	captureAt := strings.Index(script, `ReadRegStr $HimixPreviousInstallDir HKLM "${UNINST_KEY}" "InstallLocation"`)
+	compareAt := strings.Index(script, `Call DetermineInstallPathChange`)
+	recoverAt := strings.Index(script, `Call RecoverPreviousWailsInstallation`)
+	copyAt := strings.Index(script, `StrCpy $HimixSetupOperation "apply"`)
+	commitAt := strings.Index(script, `!insertmacro HimixWriteRegistration`)
+	removeAt := strings.Index(script, `Call RemovePreviousWailsInstallation`)
+	restoreAt := strings.Index(script, `Call RestoreAutostart`)
+	if captureAt < 0 || compareAt <= captureAt || recoverAt <= compareAt || copyAt <= recoverAt || commitAt <= copyAt || removeAt <= commitAt || restoreAt <= removeAt {
+		t.Fatalf(
+			"changed-directory migration order is unsafe: capture=%d compare=%d recover=%d copy=%d commit=%d remove=%d restore-autostart=%d",
+			captureAt,
+			compareAt,
+			recoverAt,
+			copyAt,
+			commitAt,
+			removeAt,
+			restoreAt,
+		)
+	}
+	comparison, err := os.ReadFile("build/windows/nsis/compare-install-directories.ps1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		`GetFileInformationByHandle`,
+		`VolumeSerialNumber`,
+		`FileIndexHigh`,
+		`FileIndexLow`,
+		`FileFlagBackupSemantics`,
+	} {
+		if !strings.Contains(string(comparison), required) {
+			t.Fatalf("directory identity comparison is missing %q", required)
+		}
+	}
+	for _, unsafe := range []string{
+		`RMDir /r "$HimixPreviousInstallDir"`,
+		`RMDir /r "$2"`,
+	} {
+		if strings.Contains(script, unsafe) {
+			t.Fatalf("changed-directory migration recursively removes the previous path via %q", unsafe)
+		}
+	}
+}
+
+func TestMachineInstallerSeparatesProtectedServiceFromCustomDesktopPath(t *testing.T) {
+	data, err := os.ReadFile("build/windows/nsis/project.nsi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := strings.ReplaceAll(string(data), "\r\n", "\n")
+	applyAt := strings.Index(script, `StrCpy $HimixSetupOperation "apply"`)
+	installAt := strings.Index(script, `"${HIMIX_PROTECTED_CORE_BIN}\himix-engine.exe" install-service --desktop`)
+	if applyAt < 0 || installAt <= applyAt {
+		t.Fatal("protected payload must be transactionally applied before service registration")
+	}
+	if strings.Contains(script, `"$INSTDIR\bin\himix-engine.exe" install-service`) {
+		t.Fatal("machine service still runs from the user-selected application directory")
+	}
+	if strings.Contains(script, `RMDir /r $INSTDIR`) || strings.Contains(script, `RMDir /r "$INSTDIR"`) {
+		t.Fatal("uninstaller still recursively removes the user-selected application directory")
+	}
+
+	protection, err := os.ReadFile("internal/setup/platform_windows.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{`secureDirectory`, `FILE_ATTRIBUTE_REPARSE_POINT`, `SetNamedSecurityInfo`, `PROTECTED_DACL_SECURITY_INFORMATION`, `NumberOfLinks`, `O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)`} {
+		if !strings.Contains(string(protection), required) {
+			t.Fatalf("missing native ACL guard %q", required)
+		}
+	}
+}
+
+func TestInstallerClearsInheritedPowerShellModulePath(t *testing.T) {
+	data, err := os.ReadFile("build/windows/nsis/project.nsi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := strings.ReplaceAll(string(data), "\r\n", "\n")
+	if !strings.Contains(script, `System::Call 'kernel32::SetEnvironmentVariable(t "PSModulePath", p 0)'`) {
+		t.Fatal("installer does not clear the inherited PowerShell module path")
+	}
+	if count := strings.Count(script, `!insertmacro HimixClearInheritedPSModulePath`); count != 2 {
+		t.Fatalf("installer and uninstaller must both clear the inherited PowerShell module path, got %d calls", count)
+	}
+}
+
+func TestInstallerWindowsVersionCheckIsForwardCompatible(t *testing.T) {
+	data, err := os.ReadFile("build/windows/nsis/project.nsi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := strings.ReplaceAll(string(data), "\r\n", "\n")
+	for _, required := range []string{
+		`ManifestSupportedOS Win10`,
+		`Function HimixCheckPlatform`,
+		`Call HimixCheckPlatform`,
+		`CurrentMajorVersionNumber`,
+		`CurrentBuildNumber`,
+		`IntCmp $0 10240 himixPlatformArchitecture himixPlatformUnsupportedWindows himixPlatformArchitecture`,
+		`${IsNativeAMD64}`,
+		`${IsNativeARM64}`,
+		`SetErrorLevel 64`,
+		`SetErrorLevel 65`,
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("forward-compatible Windows platform check is missing %q", required)
+		}
+	}
+	if strings.Contains(script, `!insertmacro wails.checkArchitecture`) {
+		t.Fatal("installer still delegates version rejection to the generated Wails macro")
+	}
+}
+
+func TestInstallerCoreShutdownBarrierIsPathScopedAndBounded(t *testing.T) {
+	data, err := os.ReadFile("build/windows/nsis/stop-core-for-upgrade.ps1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := strings.ReplaceAll(string(data), "\r\n", "\n")
+	for _, required := range []string{
+		`[System.IO.Path]::GetFullPath($_.Path).Equals(`,
+		`[System.StringComparison]::OrdinalIgnoreCase`,
+		`Stop-Process -Id $process.Id -Force -ErrorAction Stop`,
+		`[System.IO.FileAccess]::Write`,
+		`[System.IO.FileShare]::Read -bor [System.IO.FileShare]::Delete`,
+		`exit 10`,
+		`exit 11`,
+		`[DateTime]::UtcNow -lt $deadline`,
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("Core shutdown barrier is missing safety guard %q", required)
+		}
+	}
+	if strings.Contains(script, `[System.IO.FileShare]::None`) {
+		t.Fatal("Core shutdown barrier still rejects harmless shared readers")
+	}
+
+	installerData, err := os.ReadFile("build/windows/nsis/project.nsi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	installer := string(installerData)
+	for _, required := range []string{
+		`MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "$(CoreProcessStopFailed)$\r$\n$\r$\n$(CoreCheckDetails)" IDRETRY stopCoreProcessesRetry`,
+		`System::Call 'kernel32::CreateMutex(`,
+		`SetErrorLevel 66`,
+	} {
+		if !strings.Contains(installer, required) {
+			t.Fatalf("installer lock recovery is missing %q", required)
+		}
+	}
+	if count := strings.Count(installer, `!insertmacro HimixEnsureSingleInstaller`); count != 2 {
+		t.Fatalf("installer and uninstaller must share the single-instance mutex, got %d calls", count)
+	}
+}
+
+func TestLegacyRecoveryIsNarrowlyScoped(t *testing.T) {
+	data, err := os.ReadFile("build/windows/nsis/legacy-v22-recover.ps1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := strings.ReplaceAll(string(data), "\r\n", "\n")
+	for _, required := range []string{
+		`StartsWith($ownedRoot, [System.StringComparison]::OrdinalIgnoreCase)`,
+		`Where-Object InterfaceAlias -EQ 'Himix-Tun'`,
+		`Join-Path $DataRoot 'config.json'`,
+		`[string]$current.ProxyServer -ne $expected`,
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("legacy recovery is missing safety guard %q", required)
+		}
+	}
+}
+
+func TestReleasePublishesLegacyUpdaterCompatibleInstallerName(t *testing.T) {
+	data, err := os.ReadFile("../.github/workflows/build.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(data)
+	if !strings.Contains(workflow, `version="${GITHUB_REF_NAME#v}"`) ||
+		!strings.Contains(workflow, `Himix_Setup_${version}.exe`) {
+		t.Fatal("release workflow does not publish the installer name recognized by v2.2.0")
+	}
+	for _, required := range []string{
+		`INSTALLER_PATH: desktop/bin/himix-amd64-installer.exe`,
+		`cp artifacts/himix-amd64-installer.exe "artifacts/Himix_Setup_${version}.exe"`,
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("release workflow installer casing is inconsistent: missing %q", required)
+		}
+	}
+	taskData, err := os.ReadFile("build/windows/Taskfile.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(taskData), `--input "{{.BIN_DIR}}/{{.APP_NAME}}-{{.ARCH}}-installer.exe"`) {
+		t.Fatal("local installer signing task does not target the packaged NSIS artifact")
+	}
+}
+
+func TestReleasePublishesOneSignedInstallerThenUpdatesSignedChannel(t *testing.T) {
+	data, err := os.ReadFile("../.github/workflows/build.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(data)
+	for _, required := range []string{
+		`installer_sha256="$(sha256sum "${installer_path}" | awk '{print $1}')"`,
+		`schema_version: 1`,
+		`urls: [$cnb_url, $github_url]`,
+		`artifacts/latest.json`,
+		`artifacts/latest.json.sig`,
+		`UPDATE_MANIFEST_ED25519_PRIVATE_KEY`,
+		`go -C desktop run ./cmd/update-manifest-sign`,
+		`docker.cnb.cool/looc/git-cnb@sha256:c254172bb9d6025733a0e2991b4a99af8c46aeedcadcb468788ef5a0dc00275c`,
+		`secrets.CNB_TOKEN`,
+		`cnb release get -t "${tag}"`,
+		`cnb release create -t "${tag}"`,
+		`release asset-upload -t "${tag}" -f "${installer}"`,
+		`HIMIX_SIGNED_INSTALLER_TEST`,
+		`git push origin "${channel_commit}:${channel_ref}"`,
+		`git push cnb "${channel_commit}:${channel_ref}"`,
+		`https://raw.githubusercontent.com/internest-nine/Himix/${{ steps.version.outputs.channel }}/latest.json`,
+		`https://cnb.cool/internest-nine/Himix/-/git/raw/${{ steps.version.outputs.channel }}/latest.json`,
+		`-verify-only`,
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("dual-source release workflow is missing %q", required)
+		}
+	}
+	if strings.Count(workflow, `cp artifacts/himix-amd64-installer.exe`) != 1 {
+		t.Fatal("release workflow must stage exactly one signed installer for both mirrors")
+	}
+	if strings.Contains(workflow, `docker.cnb.cool/looc/git-cnb:1.2.0`) {
+		t.Fatal("release workflow uses a nonexistent mutable git-cnb image tag")
+	}
+	if strings.Contains(workflow, `files: artifacts/latest.json`) ||
+		strings.Contains(workflow, `release asset-upload -t "${tag}" -f artifacts/latest.json`) {
+		t.Fatal("release workflow exposes update metadata as Release assets")
+	}
+	if strings.Contains(workflow, `for attempt in $(seq 1 20)`) ||
+		strings.Contains(workflow, `retrying in 15 seconds`) {
+		t.Fatal("release workflow still waits for asynchronous CNB tag mirroring")
+	}
+	verifyAssets := strings.Index(workflow, `- name: Verify both Release installers are byte-identical`)
+	publishChannel := strings.Index(workflow, `- name: Publish signed update channel to GitHub and CNB`)
+	if verifyAssets < 0 || publishChannel < 0 || publishChannel < verifyAssets {
+		t.Fatal("update-channel must be published only after both Release installers are verified")
+	}
+}
+
+func TestReleaseNotesAreTheSingleSourceForReleaseBodiesAndManifest(t *testing.T) {
+	notesPath := "../.github/release-notes/v2.5.8.md"
+	notes, err := os.ReadFile(notesPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(strings.TrimSpace(string(notes))) == 0 {
+		t.Fatal("versioned release notes must not be empty")
+	}
+
+	data, err := os.ReadFile("../.github/workflows/build.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(data)
+	for _, required := range []string{
+		`release_notes_path=".github/release-notes/${GITHUB_REF_NAME}.md"`,
+		`if [[ ! -f "${release_notes_path}" ]]`,
+		`if [[ ! -s "${release_notes_path}" ]]`,
+		`--rawfile notes "${release_notes_path}"`,
+		`notes: $notes`,
+		`jq -j '.notes' artifacts/latest.json > artifacts/manifest-notes.md`,
+		`cmp --silent "${release_notes_path}" artifacts/manifest-notes.md`,
+		`name: Himix ${{ github.ref_name }}`,
+		`body_path: ${{ steps.release_notes.outputs.path }}`,
+		`release_notes_path="${{ steps.release_notes.outputs.path }}"`,
+		`--body "${release_body}" --make-latest "${{ steps.version.outputs.make_latest }}"`,
+		`cnb --json release get -t "${tag}" | jq -j '.body' > artifacts/cnb-release-notes.md`,
+		`cmp --silent "${release_notes_path}" artifacts/cnb-release-notes.md`,
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("release notes are not wired to every release consumer: missing %q", required)
+		}
+	}
+	if strings.Contains(workflow, `notes: ""`) {
+		t.Fatal("update manifest still publishes empty release notes")
+	}
+}
+
+func TestCreateReleaseTagSynchronizesCNBIdempotently(t *testing.T) {
+	data, err := os.ReadFile("../.github/workflows/create-release-tag.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(data)
+	for _, required := range []string{
+		`CNB_TOKEN: ${{ secrets.CNB_TOKEN }}`,
+		`username=cnb`,
+		`git credential approve`,
+		`git remote add cnb https://cnb.cool/internest-nine/Himix`,
+		`github_commit="$(resolve_remote_tag_commit origin)"`,
+		`cnb_commit="$(resolve_remote_tag_commit cnb)"`,
+		`git push cnb "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"`,
+		`if [[ -z "${github_commit}" ]]`,
+		`elif [[ "${github_commit}" != "${expected_commit}" ]]`,
+		`elif [[ "${cnb_commit}" != "${expected_commit}" ]]`,
+		`"${github_commit}" != "${cnb_commit}"`,
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("release tag workflow is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		`https://cnb:${CNB_TOKEN}@`,
+		`${CNB_TOKEN}@cnb.cool`,
+		`already exists and will not be moved`,
+	} {
+		if strings.Contains(workflow, forbidden) {
+			t.Fatalf("release tag workflow is not safely rerunnable: found %q", forbidden)
+		}
+	}
+}
+
+func TestReleaseTrustSmokeWorkflowIsReadOnly(t *testing.T) {
+	data, err := os.ReadFile("../.github/workflows/release-smoke.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(data)
+	for _, required := range []string{
+		`UPDATE_MANIFEST_ED25519_PRIVATE_KEY`,
+		`-verify-public-key "${public_key}"`,
+		`git ls-remote "${repository}"`,
+		`github_commit`,
+		`cnb_commit`,
+		`release get -t "${RELEASE_TAG}"`,
+		`secrets.CNB_TOKEN`,
+		`docker.cnb.cool/looc/git-cnb@sha256:c254172bb9d6025733a0e2991b4a99af8c46aeedcadcb468788ef5a0dc00275c`,
+		`refs/heads/${{ steps.version.outputs.channel }}`,
+		`https://raw.githubusercontent.com/internest-nine/Himix/${{ steps.version.outputs.channel }}/latest.json`,
+		`https://cnb.cool/internest-nine/Himix/-/git/raw/${{ steps.version.outputs.channel }}/latest.json`,
+		`-verify-only`,
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("release trust smoke workflow is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		`asset-upload`,
+		`release create`,
+		`actions/upload-artifact`,
+		`action-gh-release`,
+		`git push`,
+		`git commit-tree`,
+	} {
+		if strings.Contains(workflow, forbidden) {
+			t.Fatalf("release trust smoke workflow must be read-only: found %q", forbidden)
+		}
+	}
+}
+
+func TestVersionMetadataIsConsistent(t *testing.T) {
+	data, err := os.ReadFile("VERSION")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := releaseversion.Parse(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := releaseversion.SyncMetadata(".", v, true); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPreviewPublishingIsIsolatedFromStable(t *testing.T) {
+	data, err := os.ReadFile("../.github/workflows/build.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(data)
+	if strings.Count(workflow, `prerelease: ${{ steps.version.outputs.prerelease == 'true' }}`) != 2 {
+		t.Fatal("both GitHub release paths must explicitly classify prereleases")
+	}
+	for _, required := range []string{
+		`--prerelease=${{ steps.version.outputs.prerelease }}`,
+		`--make-latest "${{ steps.version.outputs.make_latest }}"`,
+		`channel_ref="refs/heads/${{ steps.version.outputs.channel }}"`,
+		`-tag $env:GITHUB_REF_NAME -write -notes`,
+		`group: himix-release-publish`,
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("missing release isolation guard: %s", required)
+		}
+	}
+	prepare := strings.Index(workflow, "- name: Prepare and validate release version")
+	build := strings.Index(workflow, "- name: Build and package Wails desktop")
+	if prepare < 0 || prepare > build {
+		t.Fatal("release version must be applied before building/signing")
+	}
+}
+
+func TestApplicationIdentityAndSingleInstanceAreStable(t *testing.T) {
+	mainData, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	configData, err := os.ReadFile("build/config.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestData, err := os.ReadFile("build/windows/wails.exe.manifest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const applicationID = "io.himix.desktop"
+	if !strings.Contains(string(mainData), `SingleInstance: &application.SingleInstanceOptions{`) ||
+		!strings.Contains(string(mainData), `UniqueID: "`+applicationID+`"`) {
+		t.Fatal("desktop entry point is missing the stable single-instance identity")
+	}
+	if !strings.Contains(string(configData), `productIdentifier: "`+applicationID+`"`) {
+		t.Fatal("build configuration does not use the stable product identifier")
+	}
+	if !strings.Contains(string(manifestData), `name="`+applicationID+`"`) {
+		t.Fatal("Windows manifest does not use the stable application identity")
+	}
+}
+
+func TestFrontendUsesWailsV3RuntimeDetection(t *testing.T) {
+	runtimeData, err := os.ReadFile("frontend/src/platform/runtime.ts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeSource := string(runtimeData)
+	if !strings.Contains(runtimeSource, `System.IsDesktop()`) {
+		t.Fatal("frontend runtime detection does not use the Wails v3 API")
+	}
+	if !strings.Contains(runtimeSource, `runtimeWindow.chrome?.webview?.postMessage`) {
+		t.Fatal("desktop detection still depends only on the asynchronously injected Wails environment")
+	}
+
+	paths := []string{
+		"frontend/src/theme/background.service.ts",
+		"frontend/src/state/useEngineState.ts",
+		"frontend/src/pages/HealthPage.tsx",
+		"frontend/src/pages/RoutingPage.tsx",
+	}
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(data), "__WAILS__") {
+			t.Fatalf("%s still uses the obsolete Wails v2 runtime marker", path)
+		}
+	}
+
+	backgroundData, err := os.ReadFile("frontend/src/theme/background.service.ts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(backgroundData), "isDesktopRuntime()") < 2 {
+		t.Fatal("appearance persistence is not guarded by the Wails v3 desktop check")
+	}
+	backgroundSource := string(backgroundData)
+	if strings.Contains(backgroundSource, `const { localBackgroundUrl, ...persistable }`) {
+		t.Fatal("frontend still strips the custom background before durable persistence")
+	}
+	for _, required := range []string{
+		`let persistedLocalBackgroundURL: string | undefined`,
+		`let appearanceSaveQueue: Promise<void> = Promise.resolve()`,
+		`localBackgroundURL === persistedLocalBackgroundURL`,
+		`await appServices.appearance.save(JSON.stringify(settingsToSave))`,
+		`persistedLocalBackgroundURL = localBackgroundURL`,
+	} {
+		if !strings.Contains(backgroundSource, required) {
+			t.Fatalf("appearance persistence protocol is missing %q", required)
+		}
+	}
+	if strings.Contains(backgroundSource, `localBackgroundUrl.length > 100000`) {
+		t.Fatal("frontend still guesses background persistence from Data URL size")
+	}
+}
+
+func TestHomeEngineStatePersistsAcrossPageNavigation(t *testing.T) {
+	appData, err := os.ReadFile("frontend/src/App.tsx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shellData, err := os.ReadFile("frontend/src/components/shell/AppShell.tsx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	homeData, err := os.ReadFile("frontend/src/pages/HomePage.tsx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	connectionsData, err := os.ReadFile("frontend/src/pages/ConnectionsPage.tsx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	appSource := string(appData)
+	shellSource := string(shellData)
+	homeSource := string(homeData)
+	connectionsSource := string(connectionsData)
+	for _, required := range []string{
+		`persistentPage="home"`,
+		`persistentChildren={(`,
+		`<HomePage`,
+		`onNavigate={navigate}`,
+		`onAdapterRuntimeChange={setConnectionAdapters}`,
+		`adapterRuntime: connectionAdapters`,
+		`hidden={page !== persistentPage}`,
+		`page !== persistentPage ? (`,
+	} {
+		if !strings.Contains(appSource+shellSource, required) {
+			t.Fatalf("persistent home-page state wiring is missing %q", required)
+		}
+	}
+	if strings.Contains(appSource, `: <HomePage onNavigate={navigate} />}`) {
+		t.Fatal("HomePage is still conditionally mounted and will lose an in-flight engine transition")
+	}
+	if !strings.Contains(homeSource, `engine.loading ? undefined : engine.adapters`) {
+		t.Fatal("HomePage does not propagate its authoritative adapter telemetry after loading")
+	}
+	if strings.Contains(connectionsSource, `appServices.engine.snapshot()`) ||
+		strings.Contains(connectionsSource, `setAdapterRuntime`) {
+		t.Fatal("ConnectionsPage must reuse HomePage telemetry instead of sampling engine state")
+	}
+}
+
+func TestHomeThroughputUsesLightweightFastTelemetryAndSynchronizedLayers(t *testing.T) {
+	stateData, err := os.ReadFile("frontend/src/state/useEngineState.ts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	engineData, err := os.ReadFile("internal/services/engine.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cssData, err := os.ReadFile("frontend/src/app.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateSource := string(stateData)
+	engineSource := string(engineData)
+	css := strings.ReplaceAll(string(cssData), "\r\n", "\n")
+	for _, required := range []string{
+		`export const HOME_TELEMETRY_POLL_MS = 800`,
+		`}, HOME_TELEMETRY_POLL_MS);`,
+		`map[string]any{"include_connections": false}`,
+		`.throughput-line,` + "\n" + `.throughput-line-glow,` + "\n" + `.throughput-fill {`,
+		`transition: d 680ms cubic-bezier(0.22, 1, 0.36, 1);`,
+	} {
+		if !strings.Contains(stateSource+engineSource+css, required) {
+			t.Fatalf("home throughput synchronization is missing %q", required)
+		}
+	}
+}
+
+func TestFrontendFreshInstallAppearanceDefaults(t *testing.T) {
+	mainData, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainSource := string(mainData)
+	if !strings.Contains(mainSource, `BackgroundType:   application.BackgroundTypeTranslucent`) {
+		t.Fatal("window does not support the translucent composition path used by optional Mica")
+	}
+	if strings.Contains(mainSource, `BackgroundType:   application.BackgroundTypeTransparent`) {
+		t.Fatal("Mica window still uses the transparent path that skips backdrop initialisation")
+	}
+	if !strings.Contains(mainSource, `BackdropType:                      application.None`) {
+		t.Fatal("fresh installs still request a native backdrop before appearance settings load")
+	}
+
+	presetData, err := os.ReadFile("frontend/src/theme/appearance.presets.ts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	preset := string(presetData)
+	for _, required := range []string{
+		`schemaVersion: 3`,
+		`presetId: "windows-mica"`,
+		`mode: "system"`,
+		`material: "mica"`,
+		`panelOpacity: 50`,
+		`panelBlur: 20`,
+	} {
+		if !strings.Contains(preset, required) {
+			t.Fatalf("appearance defaults are missing %q", required)
+		}
+	}
+
+	tokenData, err := os.ReadFile("frontend/src/theme/material.tokens.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens := string(tokenData)
+	if !strings.Contains(tokens, `--hm-panel-opacity: 0.5`) ||
+		!strings.Contains(tokens, `--hm-panel-blur: 20px`) {
+		t.Fatal("pre-hydration material tokens do not match the appearance defaults")
+	}
+	if !strings.Contains(tokens, `:is([data-background-source="local"], [data-background-source="builtin"])[data-panel-material="blur"] .glass-surface`) ||
+		!strings.Contains(tokens, `:is([data-background-source="local"], [data-background-source="builtin"])[data-panel-material="blur"] .network-adapter`) {
+		t.Fatal("card frosting is not scoped to local and built-in backgrounds")
+	}
+
+	settingsPageData, err := os.ReadFile("frontend/src/pages/SettingsPage.tsx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(settingsPageData), `close_to_tray: false`) {
+		t.Fatal("settings page fallback does not exit directly on close")
+	}
+	settingsPage := string(settingsPageData)
+	for _, required := range []string{
+		`updateAppearance({ backgroundSource: "system" })`,
+		`value={appearance.material}`,
+		`{ value: "mica", label: "Mica" }`,
+		`disabled={appearance.backgroundSource !== "local" && appearance.backgroundSource !== "builtin"}`,
+		`disabled={(appearance.backgroundSource !== "local" && appearance.backgroundSource !== "builtin") || appearance.panelMaterial !== "blur"}`,
+	} {
+		if !strings.Contains(settingsPage, required) {
+			t.Fatalf("appearance controls are missing %q", required)
+		}
+	}
+
+	storeData, err := os.ReadFile("frontend/src/theme/appearance.store.tsx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(storeData), `return { ...value, ...(radius === undefined ? {} : { radius }), schemaVersion: 3 }`) {
+		t.Fatal("legacy appearance settings are not migrated without overwriting the selected preset")
+	}
+}
+
+func TestWindowsTaskManagerUsesProductName(t *testing.T) {
+	infoData, err := os.ReadFile("build/windows/info.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainData, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path, source := range map[string]string{
+		"build/windows/info.json": string(infoData),
+		"main.go":                 string(mainData),
+	} {
+		if !strings.Contains(source, `Description": "Himix"`) &&
+			!strings.Contains(source, `Description: "Himix"`) {
+			t.Fatalf("%s does not expose Himix as the Windows application description", path)
+		}
+		if strings.Contains(source, "Multi-link network aggregation desktop client") {
+			t.Fatalf("%s still exposes the tagline as the Task Manager application name", path)
+		}
+	}
+	versionData, err := os.ReadFile("VERSION")
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := releaseversion.Parse(strings.TrimSpace(string(versionData)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var info struct {
+		Info map[string]map[string]string `json:"info"`
+	}
+	if err := json.Unmarshal(infoData, &info); err != nil {
+		t.Fatal(err)
+	}
+	for _, language := range []string{"0000", "0409"} {
+		table, ok := info.Info[language]
+		if !ok {
+			t.Fatalf("Windows version strings are missing language fallback %s", language)
+		}
+		for _, field := range []string{"FileVersion", "ProductVersion"} {
+			if table[field] != version.String() {
+				t.Fatalf("Windows %s %s = %q, want %q", language, field, table[field], version.String())
+			}
+		}
+	}
+}
+
+func TestCardsUseThemeAccentHoverGlow(t *testing.T) {
+	cssData, err := os.ReadFile("frontend/src/app.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(cssData)
+	for _, required := range []string{
+		`.hm-card:hover:not(:has(.hm-card:hover))`,
+		`.hm-card::before`,
+		`.hm-card::after`,
+		`--hm-card-light-strength: 0.72`,
+		`var(--hm-card-glow-border) 34%`,
+		`drop-shadow(0 0 20px var(--hm-card-glow-far))`,
+		`@media (hover: hover) and (pointer: fine)`,
+	} {
+		if !strings.Contains(css, required) {
+			t.Fatalf("card hover treatment is missing %q", required)
+		}
+	}
+	for _, removed := range []string{
+		`.network-adapter:hover {`,
+	} {
+		if strings.Contains(css, removed) {
+			t.Fatalf("card hover still changes the surface fill via %q", removed)
+		}
+	}
+
+	tokenData, err := os.ReadFile("frontend/src/theme/material.tokens.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(tokenData), `--hm-card-glow-border: color-mix(in srgb, var(--hm-accent)`) {
+		t.Fatal("card glow border is not derived from the active theme accent")
+	}
+
+	surfaceData, err := os.ReadFile("frontend/src/components/material/GlassSurface.tsx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(surfaceData), `glass-surface hm-card`) {
+		t.Fatal("shared card component does not opt into the hover glow")
+	}
+}
+
+func TestNotificationIslandKeepsWebViewBackdropSampling(t *testing.T) {
+	cssData, err := os.ReadFile("frontend/src/app.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(cssData)
+	for _, required := range []string{
+		`inset-inline: 0`,
+		`margin-inline: auto`,
+		`backdrop-filter: blur(28px) saturate(155%)`,
+		`.global-notification-frost::before`,
+		`var(--hm-wallpaper-background, var(--hm-system-background))`,
+		`.global-notification-region.is-leaving`,
+		`@keyframes dynamic-island-leave`,
+	} {
+		if !strings.Contains(css, required) {
+			t.Fatalf("notification island compositor-safe frosting is missing %q", required)
+		}
+	}
+	if strings.Contains(css, `clip-path: inset(0 42% round 22px)`) {
+		t.Fatal("notification island still uses the flashing clip-path entrance animation")
+	}
+}
+
+func TestFrontendUsesThemePaletteAndDistinctWindowMaterials(t *testing.T) {
+	tokenData, err := os.ReadFile("frontend/src/theme/material.tokens.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens := string(tokenData)
+	for _, required := range []string{
+		`--hm-window-base: #f5f7fa`,
+		`--hm-window-base: #171a21`,
+		`--hm-solid-chrome: #edf1f6`,
+		`--hm-solid-chrome: #1c2029`,
+	} {
+		if !strings.Contains(tokens, required) {
+			t.Fatalf("theme appearance token is missing %q", required)
+		}
+	}
+
+	cssData, err := os.ReadFile("frontend/src/app.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(cssData)
+	for _, required := range []string{
+		`[data-material="mica"][data-background-source="system"] .app-shell`,
+		`[data-material="solid"][data-background-source="system"] .app-shell`,
+		`background: var(--hm-window-base)`,
+		`[data-material="solid"][data-background-source="system"] .wallpaper-noise`,
+	} {
+		if !strings.Contains(css, required) {
+			t.Fatalf("window material distinction is missing %q", required)
+		}
+	}
+}

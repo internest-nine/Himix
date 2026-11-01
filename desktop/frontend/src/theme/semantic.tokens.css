@@ -1,0 +1,45 @@
+:root {
+  --hm-accent: #1677d2;
+  --hm-accent-soft: color-mix(in srgb, var(--hm-accent) 14%, transparent);
+  --hm-accent-muted: color-mix(in srgb, var(--hm-accent) 28%, transparent);
+  /* Text-safe accent: darker than the accent in light mode, lighter in dark mode. */
+  --hm-accent-strong: color-mix(in srgb, var(--hm-accent) 80%, black);
+  --hm-success: #237b59;
+  --hm-warning: #96601b;
+  --hm-danger: #bd414e;
+  --hm-focus-ring: color-mix(in srgb, var(--hm-accent) 68%, transparent);
+  /* Soft violet halo behind the launch mark, taken from the icon's gradient. */
+  --hm-launch-glow: rgba(164, 128, 236, 0.16);
+  /* Windows 11 caption close button. */
+  --hm-caption-close: #c42b1c;
+  --hm-caption-close-pressed: #a4262c;
+  --hm-caption-close-text: #ffffff;
+}
+
+[data-appearance="light"] {
+  color-scheme: light;
+  --hm-text-primary: #202632;
+  --hm-text-secondary: #49566a;
+  --hm-text-tertiary: #606c7d;
+  --hm-text-on-accent: #ffffff;
+  --hm-row-hover: rgba(0, 0, 0, 0.035);
+}
+
+[data-appearance="light"][data-background-source="local"] {
+  --hm-text-primary: #06131b;
+  --hm-text-secondary: #102630;
+  --hm-text-tertiary: #203844;
+}
+
+[data-appearance="dark"] {
+  color-scheme: dark;
+  --hm-accent-strong: color-mix(in srgb, var(--hm-accent) 58%, white);
+  --hm-success: #71d4ac;
+  --hm-warning: #efc078;
+  --hm-danger: #ff959e;
+  --hm-text-primary: #eef2f8;
+  --hm-text-secondary: #c6cfdd;
+  --hm-text-tertiary: #a3b0c2;
+  --hm-text-on-accent: #ffffff;
+  --hm-row-hover: rgba(255, 255, 255, 0.055);
+}

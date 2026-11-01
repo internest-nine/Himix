@@ -1,0 +1,86 @@
+package services
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestRealProxyStartStopAndNetworkRestore(t *testing.T) {
+	if os.Getenv("HIMIX_RUN_NETWORK_TEST") != "1" {
+		t.Skip("set HIMIX_RUN_NETWORK_TEST=1 for the explicit Windows network lifecycle check")
+	}
+	enginePath := os.Getenv("HIMIX_NETWORK_TEST_ENGINE")
+	if enginePath == "" {
+		enginePath = filepath.Clean(filepath.Join("..", "..", "..", "..", "himix-engine.exe"))
+	}
+	enginePath, err := filepath.Abs(enginePath)
+	if err != nil {
+		t.Fatalf("resolve real Core path: %v", err)
+	}
+	if _, err := os.Stat(enginePath); err != nil {
+		t.Skip("real himix-engine.exe is not available")
+	}
+	t.Setenv("HIMIX_ENGINE_PATH", enginePath)
+	t.Setenv("HIMIX_DATA_DIR", t.TempDir())
+	settings := NewSettingsService()
+	nextSettings := settings.Get()
+	nextSettings.SOCKSPort = 18080
+	nextSettings.HTTPPort = 18081
+	if _, err := settings.Update(nextSettings); err != nil {
+		t.Fatal(err)
+	}
+
+	adapters := NewAdapterService(settings)
+	available, err := adapters.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(available) == 0 {
+		t.Skip("no active IPv4 or IPv6 adapter is available")
+	}
+	if name := os.Getenv("HIMIX_NETWORK_TEST_ADAPTER"); name != "" {
+		found := false
+		for index, adapter := range available {
+			if adapter.Name == name {
+				available[0], available[index] = available[index], available[0]
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("requested network test adapter is unavailable: %s", name)
+		}
+	}
+	available[0].Selected = true
+	if _, err := adapters.SaveSelection("proxy", true, available); err != nil {
+		t.Fatal(err)
+	}
+	engine := NewEngineService(settings, adapters)
+	started := false
+	defer func() {
+		if started {
+			_, _ = engine.Stop()
+		}
+		engine.Shutdown()
+	}()
+	snapshot, err := engine.Start("proxy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started = true
+	if snapshot.Phase != "running" {
+		t.Fatalf("start phase = %q", snapshot.Phase)
+	}
+	stopped, err := engine.Stop()
+	started = false
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stopped.Phase != "stopped" {
+		t.Fatalf("stop phase = %q", stopped.Phase)
+	}
+	if _, err := os.Stat(proxyMarkerPath()); !os.IsNotExist(err) {
+		t.Fatalf("proxy ownership marker remains after stop: %v", err)
+	}
+}

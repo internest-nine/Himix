@@ -1,0 +1,661 @@
+package services
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/internest-nine/Himix/desktop/internal/engineclient"
+)
+
+type clashAPIConfig struct {
+	Endpoint string
+	Secret   string
+}
+
+type dnsResolveResult struct {
+	Addresses    []string `json:"addresses,omitempty"`
+	Domain       string   `json:"domain"`
+	Adapter      string   `json:"adapter"`
+	RecordType   string   `json:"record_type"`
+	Address      string   `json:"address"`
+	Transport    string   `json:"transport"`
+	Server       string   `json:"server"`
+	DoHPath      string   `json:"doh_path,omitempty"`
+	RelayAddress string   `json:"relay_address,omitempty"`
+	Cached       bool     `json:"cached"`
+}
+
+type tunConfigOptions struct {
+	DefaultOutbound string
+	ForceStart      bool
+	IPv4Address     string
+	Stack           string
+	DNSPolicy       string
+	IPv6Available   bool
+	IPv4Unavailable bool
+	ConfigName      string
+	ClashAPI        *clashAPIConfig
+	ConfigSHA256    *string
+	// RuleSets are the subscribed external lists. They travel in the options
+	// struct rather than the parameter list so the pinned-config call sites keep
+	// their shape; only the sets that already have a published file matter here.
+	RuleSets []RuleSet
+	// Executable is used by compatibility tests; production resolves the
+	// bundled runtime asset through the trusted installation layout.
+	Executable string
+	// A configured list is shared with the Core. sing-box evaluates this pool
+	// per query, rather than pinning the one endpoint that won startup probing.
+	DNSUpstreams []dnsResolveResult
+	// Resolve before TUN activation, independently of a custom DNS egress.
+	// Self-process/compatibility bypasses must not redetect the TUN as uplink.
+	SystemDirectAdapter *AdapterView
+}
+
+func writeSingBoxConfig(
+	endpoints map[string]string,
+	dnsAdapter AdapterView,
+	dnsResult dnsResolveResult,
+	rules []RoutingRule,
+	compatibility compatibilityPlan,
+	strictRoute bool,
+) (string, string, clashAPIConfig, error) {
+	return writeSingBoxConfigWithOptions(
+		endpoints, dnsAdapter, dnsResult, rules, compatibility, strictRoute,
+		tunConfigOptions{
+			DNSPolicy:       "auto",
+			IPv6Available:   strings.TrimSpace(dnsAdapter.SourceIPv6) != "",
+			IPv4Unavailable: strings.TrimSpace(dnsAdapter.Address) == "" && strings.TrimSpace(dnsAdapter.SourceIPv6) != "",
+		},
+	)
+}
+
+func writeSingBoxConfigWithOptions(
+	endpoints map[string]string,
+	dnsAdapter AdapterView,
+	dnsResult dnsResolveResult,
+	rules []RoutingRule,
+	compatibility compatibilityPlan,
+	strictRoute bool,
+	options tunConfigOptions,
+) (string, string, clashAPIConfig, error) {
+	defaultOutbound, err := normalizeDefaultOutbound(options.DefaultOutbound)
+	if err != nil {
+		return "", "", clashAPIConfig{}, err
+	}
+	// A default egress pointing at a NIC that is currently gone would otherwise
+	// fail the channel lookup below and refuse to start with a usable line idle.
+	defaultOutbound = projectOutbound(defaultOutbound)
+	if strings.HasPrefix(defaultOutbound, "nic_") {
+		if _, err := loopbackPort(endpoints, defaultOutbound); err != nil {
+			return "", "", clashAPIConfig{}, fmt.Errorf("全局默认规则的网卡出口不可用：%w", err)
+		}
+	}
+	stack, err := normalizeTunStack(options.Stack)
+	if err != nil {
+		return "", "", clashAPIConfig{}, err
+	}
+	ethernetPort, err := loopbackPort(endpoints, "nic_ethernet")
+	if err != nil {
+		return "", "", clashAPIConfig{}, err
+	}
+	wifiPort, err := loopbackPort(endpoints, "nic_wifi")
+	if err != nil {
+		return "", "", clashAPIConfig{}, err
+	}
+	aggregationPort, err := loopbackPort(endpoints, "aggregation")
+	if err != nil {
+		return "", "", clashAPIConfig{}, err
+	}
+	dnsPolicy := normalizeTunDNSPolicy(options.DNSPolicy)
+	var upstream map[string]any
+	if dnsPolicy == "system" {
+		upstream = map[string]any{"type": "local", "tag": "dns-local"}
+	} else {
+		upstream, err = buildDNSUpstreamForPolicy(dnsAdapter, dnsResult, dnsPolicy)
+		if err != nil {
+			return "", "", clashAPIConfig{}, err
+		}
+	}
+	singBox := strings.TrimSpace(options.Executable)
+	if singBox == "" {
+		singBox, err = resolveRuntimeAsset("sing-box.exe")
+		if err != nil {
+			return "", "", clashAPIConfig{}, err
+		}
+	}
+	dnsMode, err := singBoxTunDNSMode(singBox, dnsPolicy)
+	if err != nil {
+		return "", "", clashAPIConfig{}, err
+	}
+	if len(options.DNSUpstreams) > 0 && dnsMode == "" {
+		return "", "", clashAPIConfig{}, fmt.Errorf("多 DNS / 自定义 DoH 需要 sing-box 1.14 或更新版本，请更新运行核心")
+	}
+	clashAPI := clashAPIConfig{}
+	if options.ClashAPI != nil {
+		clashAPI = *options.ClashAPI
+	} else {
+		clashAPI, err = reserveClashAPI()
+		if err != nil {
+			return "", "", clashAPIConfig{}, err
+		}
+	}
+	processPaths := []string{}
+	for _, candidate := range []string{os.Args[0], engineExecutableOrEmpty(), singBox} {
+		if candidate == "" {
+			continue
+		}
+		if absolute, absoluteErr := filepath.Abs(candidate); absoluteErr == nil {
+			processPaths = append(processPaths, absolute)
+		}
+	}
+	// Reserve reject rule-sets even when empty so blocking can be hot-reloaded.
+	ruleSetOutbounds := []string{"nic_ethernet", "nic_wifi", "aggregation", "direct", OutboundReject}
+	for name := range endpoints {
+		if strings.HasPrefix(name, "nic_") {
+			ruleSetOutbounds = append(ruleSetOutbounds, name)
+		}
+	}
+	usesFakeIP := tunDNSNeedsFakeIP(dnsPolicy, rules, options.RuleSets)
+	ruleSetPlan, err := writeSingBoxRuleSetPlan(rules, options.RuleSets, ruleSetOutbounds, usesFakeIP)
+	if err != nil {
+		return "", "", clashAPIConfig{}, err
+	}
+	routeRules := []any{
+		map[string]any{"action": "sniff", "timeout": "300ms"},
+		map[string]any{"process_path": processPaths, "outbound": "system-direct"},
+		map[string]any{
+			"process_name": []string{"Himix.exe", "himix-engine.exe", "sing-box.exe"},
+			"outbound":     "system-direct",
+		},
+	}
+	if dnsPolicy != "system" {
+		routeRules = append(routeRules,
+			map[string]any{"port": []int{53}, "action": "hijack-dns"},
+			map[string]any{"protocol": []string{"dns"}, "action": "hijack-dns"},
+		)
+	}
+	if dnsPolicy != "system" {
+		// Resolve FakeIP/domain destinations before compatibility IP overrides
+		// decide whether to bypass user routing. DNS and self-process bypasses
+		// above must remain ahead of resolution to avoid routing loops.
+		strategy := "prefer_ipv4"
+		if options.IPv6Available && options.IPv4Unavailable {
+			strategy = "prefer_ipv6"
+		}
+		resolveRule := map[string]any{"action": "resolve", "server": "dns-local", "strategy": strategy}
+		if len(options.DNSUpstreams) > 0 {
+			delete(resolveRule, "server")
+		}
+		routeRules = append(routeRules, resolveRule)
+	}
+	routeRules = append(routeRules, singBoxCompatibilityRouteRules(compatibility, ruleSetPlan)...)
+	// Subscribed lists come before the per-outbound manual files so a
+	// higher-priority category can outrank a low-priority manual rule; the
+	// carve-outs that let an explicit rule win back its destinations live inside
+	// the recomposed rule-set files, which hot reload applies.
+	routeRules = append(routeRules, ruleSetPlan.ExternalRouteRules...)
+	routeRules = append(routeRules, ruleSetPlan.UserRouteRules...)
+	// Reject is a terminal action, not an outbound tag. Keep it after every
+	// explicit rule so only unmatched traffic is blocked.
+	if defaultOutbound == OutboundReject {
+		routeRules = append(routeRules, map[string]any{"action": "reject"})
+		defaultOutbound = "aggregation" // Unreachable fallback required by route.final.
+	}
+	directOutbound := map[string]any{"type": "direct", "tag": "direct"}
+	if directPort, directErr := loopbackPort(endpoints, "direct"); directErr == nil {
+		directOutbound = socksOutbound("direct", directPort)
+	}
+	systemDirectAdapter := dnsAdapter
+	if options.SystemDirectAdapter != nil {
+		systemDirectAdapter = *options.SystemDirectAdapter
+	}
+	outbounds := []any{
+		socksOutbound("nic_ethernet", ethernetPort),
+		socksOutbound("nic_wifi", wifiPort),
+		socksOutbound("aggregation", aggregationPort),
+		directOutbound,
+		boundSystemDirectOutbound(systemDirectAdapter),
+	}
+	for name, endpoint := range endpoints {
+		if name == "nic_ethernet" || name == "nic_wifi" || name == "aggregation" || name == "direct" ||
+			!strings.HasPrefix(name, "nic_") {
+			continue
+		}
+		port, portErr := loopbackPort(endpoints, name)
+		if portErr != nil {
+			return "", "", clashAPIConfig{}, portErr
+		}
+		_ = endpoint
+		outbounds = append(outbounds, socksOutbound(name, port))
+	}
+	dnsServers := []any{upstream}
+	dnsConfig := map[string]any{
+		"servers": dnsServers,
+		"final":   "dns-local",
+	}
+	if len(options.DNSUpstreams) > 0 {
+		dnsConfig, err = buildTUNDNSPool(dnsAdapter, options)
+		if err != nil {
+			return "", "", clashAPIConfig{}, err
+		}
+		dnsServers = dnsConfig["servers"].([]any)
+	}
+	if usesFakeIP {
+		dnsConfig["servers"] = append(dnsServers,
+			map[string]any{
+				"type": "fakeip", "tag": "dns-fakeip",
+				"inet4_range": "198.18.0.0/15", "inet6_range": "fc00::/18",
+			},
+		)
+		fakeRule := map[string]any{"query_type": []string{"A", "AAAA"}, "server": "dns-fakeip"}
+		if len(options.DNSUpstreams) > 0 {
+			// Intercepted DNS may use FakeIP. Route resolve must get real IPs
+			// through the pool, so its non-DNS metadata skips this rule.
+			fakeRule["protocol"] = []string{"dns"}
+		}
+		poolRules, _ := dnsConfig["rules"].([]any)
+		dnsConfig["rules"] = append([]any{fakeRule}, poolRules...)
+		dnsConfig["reverse_mapping"] = true
+	}
+	ipv4Address := options.IPv4Address
+	if ipv4Address == "" {
+		ipv4Address, err = availableTunIPv4Address(options.ForceStart)
+		if err != nil {
+			return "", "", clashAPIConfig{}, err
+		}
+	}
+	address := []string{ipv4Address}
+	if options.IPv6Available {
+		ipv6Address, addressErr := availableTunIPv6Address(options.ForceStart)
+		if addressErr != nil {
+			return "", "", clashAPIConfig{}, addressErr
+		}
+		address = append(address, ipv6Address)
+	}
+	tunInbound := map[string]any{
+		"type": "tun", "tag": "tun-in", "interface_name": "Himix-Tun",
+		"address": address,
+		"mtu":     1492, "auto_route": true, "strict_route": strictRoute, "stack": stack,
+	}
+	if dnsMode != "" {
+		tunInbound["dns_mode"] = dnsMode
+	}
+	tunInbound["route_exclude_address"] = tunRouteExclusions(dnsResult, dnsPolicy, options.IPv6Available)
+	if len(options.DNSUpstreams) > 0 {
+		exclusions := tunInbound["route_exclude_address"].([]string)
+		for _, result := range options.DNSUpstreams {
+			exclusions = append(exclusions, dnsBootstrapRouteExclusions(result)...)
+		}
+		tunInbound["route_exclude_address"] = uniqueNonEmpty(exclusions)
+	}
+	// Keep the database outside runtime: config staging, IPv4 fallback and
+	// sidecar restarts must all reuse the same persistent FakeIP/rule-set store.
+	cacheDirectory := filepath.Join(settingsDirectory(), "cache")
+	if err := os.MkdirAll(cacheDirectory, 0o700); err != nil {
+		return "", "", clashAPIConfig{}, fmt.Errorf("创建 sing-box 缓存目录失败：%w", err)
+	}
+	cacheConfig := map[string]any{
+		"enabled": true, "path": filepath.Join(cacheDirectory, "sing-box.db"),
+	}
+	if usesFakeIP {
+		cacheConfig["store_fakeip"] = true
+	}
+	config := map[string]any{
+		"log":       map[string]any{"level": "warn", "timestamp": true},
+		"dns":       dnsConfig,
+		"inbounds":  []any{tunInbound},
+		"outbounds": outbounds,
+		"route": map[string]any{
+			"auto_detect_interface": true, "default_domain_resolver": "dns-local",
+			"find_process": true, "final": defaultOutbound, "rules": routeRules,
+			"rule_set": ruleSetPlan.Definitions,
+		},
+		"experimental": map[string]any{
+			"cache_file": cacheConfig,
+			"clash_api": map[string]any{
+				"external_controller": clashAPI.Endpoint,
+				"secret":              clashAPI.Secret,
+			},
+		},
+	}
+	if len(options.DNSUpstreams) > 0 {
+		// The self-process direct bypass still needs a valid default resolver.
+		// User destinations go through the earlier resolve action and DNS rules.
+		config["route"].(map[string]any)["default_domain_resolver"] = dnsConfig["final"]
+	}
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return "", "", clashAPIConfig{}, fmt.Errorf("生成 TUN 配置失败：%w", err)
+	}
+	if options.ConfigSHA256 != nil {
+		digest := sha256.Sum256(data)
+		*options.ConfigSHA256 = hex.EncodeToString(digest[:])
+	}
+	directory := filepath.Join(settingsDirectory(), "runtime")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		return "", "", clashAPIConfig{}, fmt.Errorf("创建 TUN 运行目录失败：%w", err)
+	}
+	path := filepath.Join(directory, "sing-box.json")
+	if configName := strings.TrimSpace(options.ConfigName); configName != "" {
+		path = filepath.Join(directory, filepath.Base(configName))
+	}
+	temporary := path + ".tmp"
+	if err := os.WriteFile(temporary, data, 0o600); err != nil {
+		return "", "", clashAPIConfig{}, fmt.Errorf("写入 TUN 配置失败：%w", err)
+	}
+	if err := os.Rename(temporary, path); err != nil {
+		_ = os.Remove(temporary)
+		return "", "", clashAPIConfig{}, fmt.Errorf("提交 TUN 配置失败：%w", err)
+	}
+	return singBox, path, clashAPI, nil
+}
+
+// A route to "system-direct" is still a sing-box dial, not a Windows routing
+// exemption. Pin both the interface and its source addresses so re-entered Core
+// traffic cannot depend on automatic interface selection after TUN takes over.
+// Do not apply this to loopback SOCKS outbounds or to the aggregation pool.
+func boundSystemDirectOutbound(adapter AdapterView) map[string]any {
+	outbound := map[string]any{"type": "direct", "tag": "system-direct"}
+	if name := strings.TrimSpace(adapter.Name); name != "" {
+		outbound["bind_interface"] = name
+	}
+	if address := strings.TrimSpace(adapter.Address); address != "" {
+		outbound["inet4_bind_address"] = address
+	}
+	if address := strings.TrimSpace(adapter.SourceIPv6); address != "" {
+		outbound["inet6_bind_address"] = address
+	}
+	return outbound
+}
+
+// Adapter IP overrides are an exception for known third-party proxy processes,
+// never a global IP priority layer. Both overrides and the compatibility bypass
+// yield to explicit process/domain rules, including rules added by hot reload.
+// DNS interception is placed before this block by the caller.
+func singBoxCompatibilityRouteRules(compatibility compatibilityPlan, plan singBoxRuleSetPlan) []any {
+	processes := []any{}
+	if len(compatibility.ProcessPaths) > 0 {
+		processes = append(processes, map[string]any{"process_path": compatibility.ProcessPaths})
+	}
+	if len(compatibility.ProcessNames) > 0 {
+		processes = append(processes, map[string]any{"process_name": compatibility.ProcessNames})
+	}
+	if len(processes) == 0 {
+		return nil
+	}
+	guard := []any{map[string]any{"type": "logical", "mode": "or", "rules": processes}}
+	if len(plan.PriorityRuleSets) > 0 {
+		guard = append(guard, map[string]any{"rule_set": plan.PriorityRuleSets, "invert": true})
+	}
+	result := []any{}
+	for _, raw := range plan.EarlyRouteRules {
+		reference := raw.(map[string]any)
+		conditions := append([]any{}, guard...)
+		conditions = append(conditions, map[string]any{"rule_set": reference["rule_set"]})
+		result = append(result, map[string]any{
+			"type": "logical", "mode": "and", "rules": conditions, "outbound": reference["outbound"],
+		})
+	}
+	return append(result, map[string]any{
+		"type": "logical", "mode": "and", "rules": guard, "outbound": "system-direct",
+	})
+}
+
+func reserveClashAPI() (clashAPIConfig, error) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		return clashAPIConfig{}, fmt.Errorf("预留 sing-box 元数据端口失败：%w", err)
+	}
+	endpoint := listener.Addr().String()
+	if closeErr := listener.Close(); closeErr != nil {
+		return clashAPIConfig{}, fmt.Errorf("释放 sing-box 元数据端口失败：%w", closeErr)
+	}
+	token := make([]byte, 24)
+	if _, err := rand.Read(token); err != nil {
+		return clashAPIConfig{}, fmt.Errorf("生成 sing-box 元数据凭据失败：%w", err)
+	}
+	return clashAPIConfig{Endpoint: endpoint, Secret: hex.EncodeToString(token)}, nil
+}
+
+func engineExecutableOrEmpty() string {
+	path, _ := engineclient.ResolveExecutable()
+	return path
+}
+
+func socksOutbound(tag string, port int) map[string]any {
+	return map[string]any{
+		"type": "socks", "tag": tag, "server": "127.0.0.1",
+		"server_port": port, "version": "5",
+	}
+}
+
+func loopbackPort(endpoints map[string]string, name string) (int, error) {
+	value := endpoints[name]
+	host, portText, err := net.SplitHostPort(value)
+	if err != nil {
+		return 0, fmt.Errorf("聚合核心返回了无效的 %s 通道：%s", name, value)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 || (host != "127.0.0.1" && host != "localhost") {
+		return 0, fmt.Errorf("聚合核心返回了不安全的 %s 通道：%s", name, value)
+	}
+	return port, nil
+}
+
+func normalizeTunDNSPolicy(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return "auto"
+	}
+	return value
+}
+
+func normalizeTunStack(value string) (string, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "":
+		return "system", nil
+	case "system", "mixed", "gvisor":
+		return value, nil
+	default:
+		return "", fmt.Errorf("不支持的 TUN 协议栈：%s（可选 system、mixed、gvisor）", value)
+	}
+}
+
+func buildDNSUpstreamForPolicy(
+	adapter AdapterView,
+	result dnsResolveResult,
+	policy string,
+) (map[string]any, error) {
+	policy = normalizeTunDNSPolicy(policy)
+	transport := strings.ToLower(strings.TrimSpace(result.Transport))
+	if policy == "dot" && transport != "dot" {
+		return nil, fmt.Errorf("DoT 策略不允许使用其他 DNS 传输：%s", result.Transport)
+	}
+	if policy == "off" && (transport == "doh" || transport == "dot") {
+		return nil, fmt.Errorf("DNS 策略 off 不允许使用加密上游：%s", result.Server)
+	}
+	return buildDNSUpstream(adapter, result)
+}
+
+func buildDNSUpstream(adapter AdapterView, result dnsResolveResult) (map[string]any, error) {
+	if result.RelayAddress != "" {
+		host, port, err := splitEndpoint(result.RelayAddress, 53)
+		if err != nil || host != "127.0.0.1" {
+			return nil, fmt.Errorf("无效的 Core DoH 转发地址")
+		}
+		return map[string]any{"type": "udp", "tag": "dns-local", "server": host, "server_port": port}, nil
+	}
+	transport := strings.ToLower(strings.TrimSpace(result.Transport))
+	server := strings.TrimSpace(result.Server)
+	serverName := ""
+	if parts := strings.SplitN(server, "@", 2); len(parts) == 2 {
+		serverName = strings.TrimSpace(parts[0])
+		server = strings.TrimSpace(parts[1])
+	}
+	defaultPort := 53
+	upstreamType := transport
+	switch transport {
+	case "doh":
+		if serverName == "" {
+			return nil, fmt.Errorf("聚合核心返回了无效的 DoH 端点：%s", result.Server)
+		}
+		defaultPort = 443
+		upstreamType = "https"
+	case "dot":
+		defaultPort = 853
+		upstreamType = "tls"
+	case "udp", "tcp":
+	default:
+		return nil, fmt.Errorf("聚合核心返回了不支持的 DNS 传输：%s", result.Transport)
+	}
+	host, port, err := splitEndpoint(server, defaultPort)
+	if err != nil {
+		return nil, err
+	}
+	upstream := map[string]any{
+		"type": upstreamType, "tag": "dns-local", "server": host, "server_port": port,
+	}
+	if transport == "doh" {
+		upstream["path"] = "/dns-query"
+		if result.DoHPath != "" {
+			upstream["path"] = result.DoHPath
+		}
+	}
+	if transport == "doh" || transport == "dot" {
+		if serverName == "" {
+			serverName = host
+		}
+		upstream["tls"] = map[string]any{"enabled": true, "server_name": serverName}
+	}
+	if strings.TrimSpace(adapter.Name) != "" {
+		upstream["bind_interface"] = adapter.Name
+	}
+	if strings.TrimSpace(adapter.Address) != "" {
+		upstream["inet4_bind_address"] = adapter.Address
+	}
+	if strings.TrimSpace(adapter.SourceIPv6) != "" {
+		upstream["inet6_bind_address"] = adapter.SourceIPv6
+	}
+	return upstream, nil
+}
+
+func tunDNSNeedsFakeIP(policy string, rules []RoutingRule, sets []RuleSet) bool {
+	if policy != "off" && policy != "system" {
+		return true
+	}
+	for _, rule := range rules {
+		if !rule.Disabled && rule.MatchType == MatchDomain {
+			return true
+		}
+	}
+	// A subscribed list only matches domains, and only once it has actually been
+	// fetched; an un-fetched set is not referenced and must not force FakeIP.
+	return len(liveExternalRuleSets(ruleSetDirectory(), sets)) > 0
+}
+
+func dnsBootstrapRouteExclusions(result dnsResolveResult) []string {
+	seen := map[string]struct{}{}
+	for _, value := range literalIPsInEndpoint(result.Server) {
+		ip := net.ParseIP(value)
+		if ip == nil {
+			continue
+		}
+		prefix := 128
+		if ipv4 := ip.To4(); ipv4 != nil {
+			ip = ipv4
+			prefix = 32
+		}
+		seen[ip.String()+"/"+strconv.Itoa(prefix)] = struct{}{}
+	}
+	resulting := make([]string, 0, len(seen))
+	for value := range seen {
+		resulting = append(resulting, value)
+	}
+	sort.Strings(resulting)
+	return resulting
+}
+
+func literalIPsInEndpoint(value string) []string {
+	seen := map[string]struct{}{}
+	add := func(candidate string) {
+		candidate = strings.TrimSpace(strings.Trim(candidate, "[]"))
+		if ip := net.ParseIP(candidate); ip != nil {
+			if ipv4 := ip.To4(); ipv4 != nil {
+				candidate = ipv4.String()
+			} else {
+				candidate = ip.String()
+			}
+			seen[candidate] = struct{}{}
+		}
+	}
+	for _, part := range strings.Split(value, "@") {
+		part = strings.TrimSpace(part)
+		if host, _, err := net.SplitHostPort(part); err == nil {
+			add(host)
+		}
+		if strings.HasPrefix(part, "[") {
+			if end := strings.IndexByte(part, ']'); end > 1 {
+				add(part[1:end])
+			}
+		}
+		for _, candidate := range strings.FieldsFunc(part, func(r rune) bool {
+			return r == '/' || r == '?' || r == '#'
+		}) {
+			add(candidate)
+		}
+	}
+	resulting := make([]string, 0, len(seen))
+	for candidate := range seen {
+		resulting = append(resulting, candidate)
+	}
+	sort.Strings(resulting)
+	return resulting
+}
+
+func splitEndpoint(value string, defaultPort int) (string, int, error) {
+	if host, portText, err := net.SplitHostPort(value); err == nil {
+		port, parseErr := strconv.Atoi(portText)
+		if parseErr != nil || port < 1 || port > 65535 {
+			return "", 0, fmt.Errorf("无效端点：%s", value)
+		}
+		return host, port, nil
+	}
+	if net.ParseIP(value) != nil || !strings.Contains(value, ":") {
+		return value, defaultPort, nil
+	}
+	return "", 0, fmt.Errorf("无效端点：%s", value)
+}
+
+func resolveRuntimeAsset(name string) (string, error) {
+	candidates := []string{}
+	if executable, err := os.Executable(); err == nil {
+		root := filepath.Dir(executable)
+		candidates = append(candidates, filepath.Join(root, "bin", name), filepath.Join(root, name))
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		for current, count := cwd, 0; count < 6; count++ {
+			candidates = append(candidates, filepath.Join(current, "bin", name), filepath.Join(current, name))
+			parent := filepath.Dir(current)
+			if parent == current {
+				break
+			}
+			current = parent
+		}
+	}
+	for _, candidate := range candidates {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return filepath.Abs(candidate)
+		}
+	}
+	return "", fmt.Errorf("未找到 %s", name)
+}

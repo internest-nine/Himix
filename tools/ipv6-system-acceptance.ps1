@@ -1,0 +1,103 @@
+param(
+    [Parameter(Mandatory = $true)][string]$Adapter,
+    [ValidateSet('IPv6', 'IPv4')][string]$AddressFamily = 'IPv6',
+    [switch]$RequireUDP,
+    [switch]$CoreCrash,
+    [string]$NTPDomain = 'ntp.tuna.tsinghua.edu.cn',
+    [ValidateSet(0, 1280)][int]$TUNMTU = 0,
+    [string]$HTTPSDomain = 'www.qq.com',
+    [string]$PayloadPath = '/',
+    [ValidateRange(0, 16777216)][int]$PayloadBytes = 0,
+    [string]$Python = 'python',
+    [string]$OutputDirectory = '.go-cache-local/ipv6-system-acceptance'
+)
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$projectRoot = Split-Path -Parent $PSScriptRoot
+$previousInput = $env:HYPOMUX_IPV6_TUN_PREPARE_INPUT
+$exitCode = 2
+try {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'Run this explicit system test in an elevated PowerShell; it starts strict TUN and terminates only its own sidecar and optional test Core.'
+    }
+    if (@(Get-NetAdapter | Where-Object Name -eq 'Himix-Tun').Count -gt 0) {
+        throw 'An existing Himix-Tun must be stopped before this isolated test.'
+    }
+    $nic = @([Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() | Where-Object {
+        $_.Name -eq $Adapter -and $_.OperationalStatus -eq 'Up' -and $_.NetworkInterfaceType -in @('Ethernet', 'Wireless80211')
+    })
+    if ($nic.Count -ne 1) { throw 'Select one active physical Ethernet/Wi-Fi adapter.' }
+    $properties = $nic[0].GetIPProperties()
+    $family = if ($AddressFamily -eq 'IPv6') {'InterNetworkV6'} else {'InterNetwork'}
+    $sources = @($properties.UnicastAddresses | Where-Object {
+        $_.Address.AddressFamily.ToString() -eq $family -and -not $_.Address.IsIPv6LinkLocal -and
+        -not $_.Address.IsIPv6Multicast -and -not [Net.IPAddress]::IsLoopback($_.Address) -and
+        -not $_.Address.ToString().StartsWith('169.254.') -and
+        $_.DuplicateAddressDetectionState -eq 'Preferred' -and $_.AddressPreferredLifetime -gt 0 -and $_.AddressValidLifetime -gt 0
+    } | Sort-Object {
+        $priority = 0
+        if ($_.Address.AddressFamily -eq 'InterNetworkV6') {
+            if (($_.Address.GetAddressBytes()[0] -band 0xfe) -eq 0xfc) { $priority += 2 }
+            if ($_.SuffixOrigin -eq [Net.NetworkInformation.SuffixOrigin]::Random) { $priority++ }
+        }
+        $priority
+    }, { $_.Address.ToString() })
+    if ($sources.Count -eq 0) { throw "The selected adapter has no preferred usable $AddressFamily source." }
+    if ($TUNMTU -and $AddressFamily -ne 'IPv6') {throw 'The minimum MTU option requires IPv6.'}
+    $index6 = if ($AddressFamily -eq 'IPv6') {$properties.GetIPv6Properties().Index} else {0}
+    $binding = if ($AddressFamily -eq 'IPv6') {
+        @{name = $Adapter; source_ipv6 = $sources[0].Address.ToString(); ipv6_if_index = $index6}
+    } else {
+        @{name = $Adapter; source_ip = $sources[0].Address.ToString(); address = $sources[0].Address.ToString(); if_index = $properties.GetIPv4Properties().Index}
+    }
+    $output = [IO.Path]::GetFullPath($(if ([IO.Path]::IsPathRooted($OutputDirectory)) { $OutputDirectory } else { Join-Path $projectRoot $OutputDirectory }))
+    [IO.Directory]::CreateDirectory($output) | Out-Null
+    $runtime = Join-Path $projectRoot 'desktop/bin/sing-box.exe'
+    if (-not (Test-Path -LiteralPath $runtime)) { $runtime = Join-Path $projectRoot 'bin/sing-box.exe' }
+    if (-not (Test-Path -LiteralPath $runtime)) { throw 'Prepare the bundled sing-box runtime first.' }
+    $pythonCommand = Get-Command $Python -ErrorAction Stop
+    & $pythonCommand.Source -c 'import sys; assert sys.version_info >= (3, 10), "Python 3.10 or newer required"'
+    if ($LASTEXITCODE -ne 0) { throw 'Python runtime validation failed.' }
+    $exitCode = 1
+    $engine = Join-Path $output 'ipv6-himix-engine.exe'
+    & go -C (Join-Path $projectRoot 'engine') build -trimpath -o $engine ./cmd/himix-engine
+    if ($LASTEXITCODE -ne 0) { throw 'Build Core failed.' }
+    & go build -trimpath -o (Join-Path $output 'ipv6-system-client.exe') (Join-Path $PSScriptRoot 'qualification/ipv6-system-client.go')
+    if ($LASTEXITCODE -ne 0) { throw 'Build independent client failed.' }
+    Copy-Item -LiteralPath $runtime -Destination (Join-Path $output 'sing-box.exe')
+    $endpoints = @{}
+    $listeners = @()
+    try {
+        foreach ($name in @('nic_ethernet', 'nic_wifi', 'aggregation')) {
+            $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+            $listeners += $listener
+            $listener.Start()
+            $endpoints[$name] = '127.0.0.1:' + $listener.LocalEndpoint.Port
+        }
+    } finally { foreach ($listener in $listeners) { $listener.Stop() } }
+    $servers = @($properties.DnsAddresses | Where-Object {
+        $AddressFamily -eq 'IPv6' -or $_.AddressFamily -eq 'InterNetwork'
+    } | ForEach-Object {
+        if ($_.AddressFamily -eq 'InterNetworkV6' -and $_.IsIPv6LinkLocal) { $_.ToString().Split('%')[0] + '%' + $properties.GetIPv6Properties().Index } else { $_.ToString() }
+    } | Select-Object -Unique)
+    $inputPath = Join-Path $output 'preparation.json'
+    $binding.dns_servers = $servers
+    $prepared = @{adapter = $binding; address_family = $AddressFamily; endpoints = $endpoints; core = $engine; output = (Join-Path $output 'config'); udp_domain = $(if ($RequireUDP) { $NTPDomain } else { '' }); tun_mtu = $TUNMTU; https_domain = $HTTPSDomain; payload_path = $PayloadPath; payload_bytes = $PayloadBytes; core_crash = [bool]$CoreCrash} | ConvertTo-Json -Depth 6
+    [IO.File]::WriteAllText($inputPath, $prepared, (New-Object Text.UTF8Encoding($false)))
+    $env:HYPOMUX_IPV6_TUN_PREPARE_INPUT = $inputPath
+    & go -C (Join-Path $projectRoot 'desktop') test ./internal/services -run '^TestPrepareIPv6SystemAcceptanceConfig$' -count=1 -timeout 90s
+    if ($LASTEXITCODE -ne 0) { throw 'Production configuration preparation failed.' }
+    $manifest = Get-Content -LiteralPath (Join-Path $output 'config/activation.json') -Raw | ConvertFrom-Json
+    & (Join-Path $output 'sing-box.exe') check -c $manifest.config_path
+    if ($LASTEXITCODE -ne 0) { throw 'Bundled runtime rejected the production configuration.' }
+    & $pythonCommand.Source (Join-Path $PSScriptRoot 'qualification/ipv6-system-acceptance.py') --input $inputPath
+    $exitCode = $LASTEXITCODE
+    Write-Host ('Report: ' + (Join-Path $output 'ipv6-system-tun-acceptance.json'))
+} catch {
+    Write-Host $_.Exception.Message
+} finally {
+    $env:HYPOMUX_IPV6_TUN_PREPARE_INPUT = $previousInput
+}
+exit $exitCode

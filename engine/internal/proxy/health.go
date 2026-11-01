@@ -1,0 +1,420 @@
+package proxy
+
+import (
+	"context"
+	"errors"
+	"net"
+	"sort"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/internest-nine/Himix/engine/internal/expiry"
+)
+
+const (
+	domainFailureThreshold = 2
+	domainEvidenceTTL      = 10 * time.Minute
+	domainQuarantineTTL    = 30 * time.Minute
+)
+
+// Consecutive connect timeouts that another adapter overcame for the same flow
+// before the link itself is cooled down. The timeouts must also span distinct
+// destinations: one network that only this link cannot reach (a blocked CDN
+// range, an intranet behind another NIC) is not evidence that the link is dead.
+const (
+	adapterTimeoutFailureThreshold = 3
+	adapterTimeoutTargetThreshold  = 2
+)
+
+var adapterFailureBackoff = [...]time.Duration{
+	2 * time.Second,
+	5 * time.Second,
+	15 * time.Second,
+	30 * time.Second,
+}
+
+type adapterHealth struct {
+	consecutiveFailures int
+	timeoutFailures     int
+	timeoutTargets      map[string]struct{}
+	successes           uint64
+	failures            uint64
+	lastSuccessAt       time.Time
+	lastFailureAt       time.Time
+	cooldownUntil       time.Time
+	domains             map[string]*domainHealth
+	domainExpiry        expiry.Index[string]
+}
+
+type domainHealth struct {
+	evidence  int
+	expiresAt time.Time
+}
+
+type healthTable struct {
+	mu                    sync.Mutex
+	adapters              map[string]*adapterHealth
+	families              map[familyHealthKey]FamilyHealthSnapshot
+	now                   func() time.Time
+	domainIsolation       bool
+	domainIsolationExpiry bool
+}
+
+type adapterHealthSnapshot struct {
+	State               string
+	ConsecutiveFailures int
+	Successes           uint64
+	Failures            uint64
+	LastSuccessAt       time.Time
+	LastFailureAt       time.Time
+	CooldownUntil       time.Time
+	DomainQuarantines   int
+}
+
+type domainQuarantineSnapshot struct {
+	Adapter   string
+	Domain    string
+	Evidence  int
+	ExpiresAt time.Time
+}
+
+func newHealthTable(adapters []Adapter) *healthTable {
+	return newHealthTableConfigured(adapters, true, true, nil)
+}
+
+func newHealthTableConfigured(
+	adapters []Adapter,
+	domainIsolation bool,
+	domainIsolationExpiry bool,
+	seeds []DomainQuarantineSeed,
+) *healthTable {
+	table := &healthTable{
+		adapters:              make(map[string]*adapterHealth, len(adapters)),
+		now:                   time.Now,
+		domainIsolation:       domainIsolation,
+		domainIsolationExpiry: domainIsolationExpiry,
+	}
+	for _, adapter := range adapters {
+		table.adapters[adapter.Name] = &adapterHealth{
+			domains: make(map[string]*domainHealth),
+		}
+	}
+	for _, seed := range seeds {
+		state := table.adapters[seed.Adapter]
+		if state == nil {
+			continue
+		}
+		domain := normalizeDomain(seed.Domain)
+		state.domains[domain] = &domainHealth{
+			evidence: domainFailureThreshold, expiresAt: seed.ExpiresAt.UTC(),
+		}
+		if !seed.ExpiresAt.IsZero() {
+			state.domainExpiry.Set(domain, seed.ExpiresAt.UTC())
+		} else {
+			state.domainExpiry.Delete(domain)
+		}
+	}
+	return table
+}
+
+func (h *healthTable) candidates(
+	adapters []Adapter,
+	excluded map[string]struct{},
+	domain string,
+) []Adapter {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	now := h.now()
+	domain = normalizeDomain(domain)
+	if !h.domainIsolation {
+		domain = ""
+	}
+	// One backing array for the four candidate partitions instead of four
+	// separate allocations. This runs on every adapter selection, so the
+	// allocation count matters. Each segment keeps cap == len(adapters) so the
+	// appends below never reallocate.
+	total := len(adapters)
+	storage := make([]Adapter, 4*total)
+	healthy := storage[0:0:total]
+	domainFallback := storage[total : total : 2*total]
+	recovery := storage[2*total : 2*total : 3*total]
+	all := storage[3*total : 3*total : 4*total]
+	for _, adapter := range adapters {
+		if _, skip := excluded[adapter.Name]; skip {
+			continue
+		}
+		state := h.adapters[adapter.Name]
+		if state == nil {
+			continue
+		}
+		h.pruneExpiredDomains(state, now)
+		all = append(all, adapter)
+		cooling := state.cooldownUntil.After(now)
+		quarantined := h.domainQuarantined(state, domain, now)
+		if !cooling {
+			domainFallback = append(domainFallback, adapter)
+			if !quarantined {
+				healthy = append(healthy, adapter)
+			}
+		}
+		if !quarantined {
+			recovery = append(recovery, adapter)
+		}
+	}
+	if len(healthy) > 0 {
+		return healthy
+	}
+	// Domain isolation must not turn a destination into a total outage.
+	if len(domainFallback) > 0 {
+		return domainFallback
+	}
+	// If every link is cooling down, keep one recovery path available.
+	if len(recovery) > 0 {
+		return earliestCooldown(recovery, h.adapters)
+	}
+	return earliestCooldown(all, h.adapters)
+}
+
+func (h *healthTable) recordLocalFailure(name string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	state := h.adapters[name]
+	if state == nil {
+		return
+	}
+	h.coolDownLocked(state)
+}
+
+// recordComparativeTimeout counts a connect timeout on name that another
+// adapter overcame for the same flow. A link that keeps its address but stops
+// forwarding (Wi-Fi out of range, an expired captive portal) yields no local
+// errno, so without this it stays "healthy" and every new flow pays a full
+// connect budget on it before falling back. Timeouts seen on every adapter,
+// such as an unreachable destination, never reach this method. target is the
+// destination key from timeoutTargetKey.
+func (h *healthTable) recordComparativeTimeout(name string, target string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	state := h.adapters[name]
+	if state == nil {
+		return
+	}
+	state.timeoutFailures++
+	// Only the count up to the threshold matters, so the set stays bounded.
+	if len(state.timeoutTargets) < adapterTimeoutTargetThreshold {
+		if state.timeoutTargets == nil {
+			state.timeoutTargets = make(map[string]struct{}, adapterTimeoutTargetThreshold)
+		}
+		state.timeoutTargets[target] = struct{}{}
+	}
+	if state.timeoutFailures < adapterTimeoutFailureThreshold ||
+		len(state.timeoutTargets) < adapterTimeoutTargetThreshold {
+		return
+	}
+	// Keep the counter: a half-open probe that times out again escalates the
+	// backoff immediately, while any success resets it.
+	h.coolDownLocked(state)
+}
+
+func (h *healthTable) coolDownLocked(state *adapterHealth) {
+	now := h.now().UTC()
+	state.failures++
+	state.consecutiveFailures++
+	state.lastFailureAt = now
+	index := state.consecutiveFailures - 1
+	if index >= len(adapterFailureBackoff) {
+		index = len(adapterFailureBackoff) - 1
+	}
+	state.cooldownUntil = now.Add(adapterFailureBackoff[index])
+}
+
+func (h *healthTable) recordSuccess(name string, domain string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	state := h.adapters[name]
+	if state == nil {
+		return
+	}
+	now := h.now().UTC()
+	state.successes++
+	state.consecutiveFailures = 0
+	state.timeoutFailures = 0
+	state.timeoutTargets = nil
+	state.cooldownUntil = time.Time{}
+	state.lastSuccessAt = now
+	domain = normalizeDomain(domain)
+	delete(state.domains, domain)
+	state.domainExpiry.Delete(domain)
+}
+
+func (h *healthTable) recordComparativeDomainFailure(
+	name string,
+	domain string,
+) {
+	if !h.domainIsolation {
+		return
+	}
+	domain = normalizeDomain(domain)
+	if domain == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	state := h.adapters[name]
+	if state == nil {
+		return
+	}
+	now := h.now().UTC()
+	h.pruneExpiredDomains(state, now)
+	entry := state.domains[domain]
+	if entry == nil || (!entry.expiresAt.IsZero() && !entry.expiresAt.After(now)) {
+		entry = &domainHealth{}
+		state.domains[domain] = entry
+	}
+	entry.evidence++
+	if entry.evidence >= domainFailureThreshold {
+		if h.domainIsolationExpiry {
+			entry.expiresAt = now.Add(domainQuarantineTTL)
+		} else {
+			entry.expiresAt = now.AddDate(100, 0, 0)
+		}
+	} else {
+		entry.expiresAt = now.Add(domainEvidenceTTL)
+	}
+	state.domainExpiry.Set(domain, entry.expiresAt)
+}
+
+func (h *healthTable) snapshot() (
+	map[string]adapterHealthSnapshot,
+	[]domainQuarantineSnapshot,
+) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	now := h.now().UTC()
+	adapters := make(map[string]adapterHealthSnapshot, len(h.adapters))
+	var quarantines []domainQuarantineSnapshot
+	for name, state := range h.adapters {
+		h.pruneExpiredDomains(state, now)
+		domainCount := 0
+		for domain, entry := range state.domains {
+			if !h.domainIsolation {
+				break
+			}
+			if entry.evidence < domainFailureThreshold ||
+				!entry.expiresAt.After(now) {
+				continue
+			}
+			domainCount++
+			quarantines = append(quarantines, domainQuarantineSnapshot{
+				Adapter:   name,
+				Domain:    domain,
+				Evidence:  entry.evidence,
+				ExpiresAt: entry.expiresAt,
+			})
+		}
+		stateName := "healthy"
+		if state.cooldownUntil.After(now) {
+			stateName = "cooldown"
+		} else if state.consecutiveFailures > 0 {
+			stateName = "probing"
+		}
+		adapters[name] = adapterHealthSnapshot{
+			State:               stateName,
+			ConsecutiveFailures: state.consecutiveFailures,
+			Successes:           state.successes,
+			Failures:            state.failures,
+			LastSuccessAt:       state.lastSuccessAt,
+			LastFailureAt:       state.lastFailureAt,
+			CooldownUntil:       state.cooldownUntil,
+			DomainQuarantines:   domainCount,
+		}
+	}
+	sort.Slice(quarantines, func(i int, j int) bool {
+		if quarantines[i].Adapter == quarantines[j].Adapter {
+			return quarantines[i].Domain < quarantines[j].Domain
+		}
+		return quarantines[i].Adapter < quarantines[j].Adapter
+	})
+	return adapters, quarantines
+}
+
+func (h *healthTable) domainQuarantined(
+	state *adapterHealth,
+	domain string,
+	now time.Time,
+) bool {
+	if domain == "" {
+		return false
+	}
+	entry := state.domains[domain]
+	return entry != nil &&
+		entry.evidence >= domainFailureThreshold &&
+		entry.expiresAt.After(now)
+}
+
+func (h *healthTable) pruneExpiredDomains(
+	state *adapterHealth,
+	now time.Time,
+) {
+	for {
+		domain, ok := state.domainExpiry.PopExpired(now)
+		if !ok {
+			return
+		}
+		delete(state.domains, domain)
+	}
+}
+
+func earliestCooldown(
+	adapters []Adapter,
+	states map[string]*adapterHealth,
+) []Adapter {
+	if len(adapters) < 2 {
+		return adapters
+	}
+	selected := adapters[0]
+	for _, adapter := range adapters[1:] {
+		if states[adapter.Name].cooldownUntil.Before(
+			states[selected.Name].cooldownUntil,
+		) {
+			selected = adapter
+		}
+	}
+	return []Adapter{selected}
+}
+
+func normalizeDomain(domain string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
+}
+
+// timeoutTargetKey groups destinations for timeout evidence. Literal IPs are
+// folded to their /24 or /48 so that the addresses of one blocked service do
+// not count as separate destinations; domain targets use the domain itself.
+func timeoutTargetKey(host string, ip net.IP) string {
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4.Mask(net.CIDRMask(24, 32)).String() + "/24"
+	}
+	if ip != nil {
+		return ip.Mask(net.CIDRMask(48, 128)).String() + "/48"
+	}
+	return normalizeDomain(host)
+}
+
+func isConnectTimeout(err error) bool {
+	var networkError net.Error
+	return errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &networkError) && networkError.Timeout())
+}
+
+func isLocalConnectFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var errno syscall.Errno
+	if !errors.As(err, &errno) {
+		return false
+	}
+	return isLocalConnectErrno(errno)
+}

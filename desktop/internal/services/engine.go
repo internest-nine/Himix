@@ -1,0 +1,1431 @@
+package services
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/internest-nine/Himix/desktop/internal/engineclient"
+)
+
+type engineState struct {
+	State          string    `json:"state"`
+	Sequence       uint64    `json:"sequence"`
+	StateChangedAt time.Time `json:"state_changed_at"`
+	Reason         string    `json:"reason,omitempty"`
+}
+
+const ipv4TUNFallbackNotice = "提示：TUN IPv6 地址配置失败，当前仅接管 IPv4 流量。"
+
+func withTUNFallbackNotice(reason string, ipv4Only bool) string {
+	if ipv4Only {
+		return strings.TrimSpace(ipv4TUNFallbackNotice + " " + reason)
+	}
+	return reason
+}
+
+type engineStatusResult struct {
+	Engine engineState `json:"engine"`
+}
+
+type engineEndpoints struct {
+	SOCKS    string            `json:"socks,omitempty"`
+	HTTP     string            `json:"http,omitempty"`
+	Channels map[string]string `json:"channels,omitempty"`
+}
+
+type engineStartResult struct {
+	State     engineState     `json:"state"`
+	Mode      string          `json:"mode"`
+	Endpoints engineEndpoints `json:"endpoints"`
+}
+
+type tunStatus struct {
+	State     string `json:"state"`
+	LastError string `json:"last_error,omitempty"`
+}
+
+type tunLifecycleResult struct {
+	Accepted              bool      `json:"accepted"`
+	RecoveredStaleAdapter bool      `json:"recovered_stale_adapter"`
+	IPv4OnlyFallback      bool      `json:"ipv4_only_fallback"`
+	Tun                   tunStatus `json:"tun"`
+}
+
+type adapterTelemetry struct {
+	Name        string              `json:"name"`
+	Connections int                 `json:"connections"`
+	BytesUp     int64               `json:"bytes_up"`
+	BytesDown   int64               `json:"bytes_down"`
+	HealthState string              `json:"health_state"`
+	IPv4Health  FamilyRuntimeHealth `json:"ipv4_health,omitempty"`
+	IPv6Health  FamilyRuntimeHealth `json:"ipv6_health,omitempty"`
+	HealthFails int64               `json:"health_failures"`
+	HealthOK    int64               `json:"health_successes"`
+}
+
+type connectionTelemetry struct {
+	ID        uint64    `json:"id"`
+	Protocol  string    `json:"protocol"`
+	Channel   string    `json:"channel,omitempty"`
+	Client    string    `json:"client"`
+	Listener  string    `json:"listener,omitempty"`
+	Target    string    `json:"target,omitempty"`
+	Remote    string    `json:"remote,omitempty"`
+	Adapter   string    `json:"adapter,omitempty"`
+	StartedAt time.Time `json:"started_at"`
+	BytesUp   int64     `json:"bytes_up"`
+	BytesDown int64     `json:"bytes_down"`
+}
+
+type telemetryResult struct {
+	Scheduling struct {
+		Strategy             string `json:"strategy"`
+		EffectiveTCPStrategy string `json:"effective_tcp_strategy"`
+		UDPStrategy          string `json:"udp_strategy"`
+		UDPState             string `json:"udp_state"`
+	} `json:"scheduling"`
+	SteamCDN          SteamCDNStatus        `json:"steam_cdn"`
+	StartedAt         time.Time             `json:"started_at"`
+	SampledAt         time.Time             `json:"sampled_at"`
+	TCPProfile        string                `json:"tcp_profile,omitempty"`
+	UDPProfile        string                `json:"udp_profile,omitempty"`
+	Adapters          []adapterTelemetry    `json:"adapters"`
+	Connections       []connectionTelemetry `json:"active_connections"`
+	DomainQuarantines []struct {
+		Adapter   string    `json:"adapter"`
+		Domain    string    `json:"domain"`
+		Evidence  int       `json:"evidence"`
+		ExpiresAt time.Time `json:"expires_at"`
+	} `json:"domain_quarantines"`
+	Total struct {
+		Connections int   `json:"connections"`
+		BytesUp     int64 `json:"bytes_up"`
+		BytesDown   int64 `json:"bytes_down"`
+	} `json:"total"`
+}
+
+type AdapterRuntime struct {
+	ID          string              `json:"id"`
+	DownloadBPS float64             `json:"download_bps"`
+	UploadBPS   float64             `json:"upload_bps"`
+	Connections int                 `json:"connections"`
+	BytesDown   int64               `json:"bytes_down"`
+	BytesUp     int64               `json:"bytes_up"`
+	HealthState string              `json:"health_state"`
+	IPv4Health  FamilyRuntimeHealth `json:"ipv4_health,omitempty"`
+	IPv6Health  FamilyRuntimeHealth `json:"ipv6_health,omitempty"`
+}
+
+type FamilyRuntimeHealth struct {
+	State               string `json:"state"`
+	Successes           uint64 `json:"successes"`
+	Failures            uint64 `json:"failures"`
+	ConsecutiveFailures int    `json:"consecutive_failures"`
+}
+
+type EngineSnapshot struct {
+	Phase         string  `json:"phase"`
+	Mode          string  `json:"mode"`
+	Strategy      string  `json:"strategy,omitempty"`
+	Weighted      bool    `json:"weighted"`
+	Reason        string  `json:"reason,omitempty"`
+	CoreConnected bool    `json:"core_connected"`
+	CoreVersion   string  `json:"core_version,omitempty"`
+	CoreElevated  bool    `json:"core_elevated"`
+	DownloadBPS   float64 `json:"download_bps"`
+	UploadBPS     float64 `json:"upload_bps"`
+	Connections   int     `json:"connections"`
+	SessionBytes  int64   `json:"session_bytes"`
+	TCPProfile    string  `json:"tcp_profile,omitempty"`
+	// LinkFailover drives the "a line dropped, traffic moved" banner. It rides
+	// along with the snapshot so the UI keeps a single polling loop.
+	LinkFailover     LinkFailoverState `json:"link_failover"`
+	IPv4OnlyFallback bool              `json:"ipv4_only_fallback,omitempty"`
+	Adapters         []AdapterRuntime  `json:"adapters"`
+	SampledAt        time.Time         `json:"sampled_at"`
+}
+
+type WFPRepairResult struct {
+	Elevated        bool   `json:"elevated"`
+	BFERunning      bool   `json:"bfe_running"`
+	EngineReady     bool   `json:"engine_ready"`
+	RepairAttempted bool   `json:"repair_attempted"`
+	Repaired        bool   `json:"repaired"`
+	Detail          string `json:"detail,omitempty"`
+}
+
+type HostPrivilegeCompatibility struct {
+	Elevated  bool
+	ProxySafe bool
+	Detail    string
+}
+
+type telemetrySample struct {
+	startedAt    time.Time
+	at           time.Time
+	down         int64
+	up           int64
+	adapters     map[string][2]int64
+	downloadBPS  float64
+	uploadBPS    float64
+	adapterRates map[string][2]float64
+}
+
+type EngineService struct {
+	hotspot                *hotspotSession
+	hotspotStart           *hotspotStart
+	mu                     sync.Mutex
+	lifecycleGate          chan struct{}
+	transitionPhase        string
+	client                 *engineclient.Client
+	settings               *SettingsService
+	adapters               *AdapterService
+	logs                   *SupportLogStore
+	tun                    *TunService
+	last                   telemetrySample
+	lastCDNLog             time.Time
+	lastPerformanceLog     time.Time
+	lastTUNHealthCheck     time.Time
+	tunNetworkFingerprint  string
+	runtimeAdapters        func() ([]AdapterView, error)
+	runtimeBindings        []AdapterView
+	runtimeBindingMode     string
+	runtimeBindingNotice   string
+	runtimeBindingCancel   context.CancelFunc
+	runtimeBindingRefresh  bool
+	runtimeBindingEnabled  bool
+	runtimeBindingRecovery *runtimeBindingRecovery
+	bindingMonitorDone     chan struct{}
+	tunConnectivityNotice  string
+	ipv4OnlyFallback       bool
+	blockedDomains         *BlockedDomainService
+	dnsFallbackApplied     bool
+	wfpFallbackApplied     bool
+	compatRestarting       bool
+	compatibilityNotice    string
+	proxyRecoveryNotice    string
+	proxyRecoveryError     string
+	hostElevated           bool
+	elevatedProxySafe      bool
+	hostPrivilegeDetail    string
+	clashAPI               clashAPIConfig
+	tunAggregationEndpoint string
+	tunDNSBootstrap        dnsResolveResult
+	tunDefaultOutbound     string
+	// Link failover state. Guarded by mu; see linkwatch.go.
+	linkDegraded           bool
+	linkLossSignature      string
+	linkDefaultEgressStale bool
+	linkLostAdapters       []string
+	linkActiveAdapters     []string
+	linkSwitchAt           time.Time
+	linkRecoverSince       time.Time
+	linkKnownAdapters      map[string]bool
+	linkRequest            func(context.Context, string, any, any) error
+	closing                bool
+}
+
+type dnsFallbackEvent struct {
+	Adapter string `json:"adapter"`
+	Policy  string `json:"policy"`
+	Reason  string `json:"reason"`
+}
+
+type coreLogEvent struct {
+	Component string `json:"component"`
+	Message   string `json:"message"`
+}
+
+func shouldTakeOverSystemProxy(mode string, settings AppSettings) bool {
+	return mode == "proxy" && settings.SystemProxyTakeover
+}
+
+func NewEngineService(settings *SettingsService, adapters *AdapterService, logs ...*SupportLogStore) *EngineService {
+	return newEngineService(settings, adapters, nil, HostPrivilegeCompatibility{}, logs...)
+}
+
+func NewEngineServiceWithDomains(
+	settings *SettingsService,
+	adapters *AdapterService,
+	blockedDomains *BlockedDomainService,
+	logs ...*SupportLogStore,
+) *EngineService {
+	return newEngineService(settings, adapters, blockedDomains, HostPrivilegeCompatibility{}, logs...)
+}
+
+func NewEngineServiceWithDomainsAndHostPrivilege(
+	settings *SettingsService,
+	adapters *AdapterService,
+	blockedDomains *BlockedDomainService,
+	hostPrivilege HostPrivilegeCompatibility,
+	logs ...*SupportLogStore,
+) *EngineService {
+	return newEngineService(settings, adapters, blockedDomains, hostPrivilege, logs...)
+}
+
+func newEngineService(
+	settings *SettingsService,
+	adapters *AdapterService,
+	blockedDomains *BlockedDomainService,
+	hostPrivilege HostPrivilegeCompatibility,
+	logs ...*SupportLogStore,
+) *EngineService {
+	var recoveryNotice string
+	var recoveryErr error
+	if !hostPrivilege.Elevated || hostPrivilege.ProxySafe {
+		recoveryNotice, recoveryErr = restoreSystemProxyDetailed()
+	}
+	var supportLogs *SupportLogStore
+	if len(logs) > 0 {
+		supportLogs = logs[0]
+	}
+	service := &EngineService{
+		client: engineclient.New(), settings: settings, adapters: adapters,
+		logs: supportLogs, tun: NewTunService(settings, adapters),
+		blockedDomains: blockedDomains, lifecycleGate: make(chan struct{}, 1),
+		proxyRecoveryNotice: recoveryNotice,
+		hostElevated:        hostPrivilege.Elevated,
+		elevatedProxySafe:   hostPrivilege.ProxySafe,
+		hostPrivilegeDetail: strings.TrimSpace(hostPrivilege.Detail),
+	}
+	if recoveryErr != nil {
+		service.proxyRecoveryError = recoveryErr.Error()
+	}
+	if supportLogs != nil {
+		if hostPrivilege.Elevated {
+			supportLogs.RecordEvent("host_privilege", "compatibility_mode", map[string]any{
+				"proxy_safe": hostPrivilege.ProxySafe,
+				"detail":     strings.TrimSpace(hostPrivilege.Detail),
+			})
+		}
+		if service.proxyRecoveryError != "" {
+			supportLogs.RecordEvent("system_proxy", "startup_recovery_failed", map[string]any{"message": service.proxyRecoveryError})
+		} else if service.proxyRecoveryNotice != "" {
+			supportLogs.RecordEvent("system_proxy", "startup_recovery_notice", map[string]any{"message": service.proxyRecoveryNotice})
+		}
+	}
+	adapters.saveRuntimeSelection = service.saveRuntimeSelection
+	service.bindingMonitorDone = make(chan struct{})
+	go service.consumeCoreEvents()
+	go service.watchRuntimeBindings()
+	go service.watchLiveLinks(service.client.Done())
+	return service
+}
+
+func (s *EngineService) consumeCoreEvents() {
+	events := s.client.Events()
+	done := s.client.Done()
+	for {
+		var event engineclient.Event
+		select {
+		case event = <-events:
+		case <-done:
+			return
+		}
+		switch event.Name {
+		case "dns.fallback_required":
+			var fallback dnsFallbackEvent
+			if json.Unmarshal(event.Data, &fallback) == nil {
+				s.handleDNSFallback(fallback)
+			}
+		case "tun.state_changed":
+			var status tunStatus
+			if json.Unmarshal(event.Data, &status) == nil &&
+				status.State == "failed" && isWFPCompatibilityError(status.LastError) {
+				s.handleWFPCompatibility(status)
+			}
+		case "log.record":
+			var record coreLogEvent
+			if s.logs != nil && json.Unmarshal(event.Data, &record) == nil {
+				s.logs.Record("[Core/"+record.Component+"] "+record.Message, false)
+			}
+		}
+	}
+}
+
+func (s *EngineService) handleDNSFallback(event dnsFallbackEvent) {
+	s.mu.Lock()
+	settings := s.settings.Get()
+	if s.closing || settings.Mode != "tun" || settings.DNSPolicy == "custom" || event.Policy == "custom" || settings.DNSPolicy == "dot" || event.Policy == "dot" || s.dnsFallbackApplied || s.compatRestarting {
+		s.mu.Unlock()
+		return
+	}
+	s.dnsFallbackApplied = true
+	s.compatRestarting = true
+	s.compatibilityNotice = ""
+	if s.logs != nil {
+		s.logs.RecordEvent("dns_compatibility", "restart_requested", map[string]any{
+			"adapter": event.Adapter, "policy": event.Policy, "reason": event.Reason,
+		})
+	}
+	s.mu.Unlock()
+
+	_, stopErr := s.Stop()
+	_, startErr := s.Start("tun")
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.compatRestarting = false
+	if stopErr != nil || startErr != nil {
+		s.compatibilityNotice = "提示：DoH 兼容模式重启失败，聚合已停止；请检查日志后重试"
+		if s.logs != nil {
+			s.logs.RecordEvent("dns_compatibility", "restart_failed", map[string]any{
+				"stop_error": errorText(stopErr), "start_error": errorText(startErr),
+			})
+		}
+		return
+	}
+	s.compatibilityNotice = "提示：检测到当前网络的 DoH 不兼容，已自动切换传统 DNS 并完成一次受控重启"
+	if s.logs != nil {
+		s.logs.RecordEvent("dns_compatibility", "restart_completed", map[string]any{
+			"adapter": event.Adapter, "previous_policy": event.Policy,
+		})
+	}
+}
+
+func (s *EngineService) handleWFPCompatibility(status tunStatus) {
+	s.mu.Lock()
+	settings := s.settings.Get()
+	if s.closing || settings.Mode != "tun" || !settings.StrictRoute ||
+		s.wfpFallbackApplied || s.compatRestarting {
+		s.mu.Unlock()
+		return
+	}
+	s.wfpFallbackApplied = true
+	s.compatRestarting = true
+	s.compatibilityNotice = ""
+	_ = s.settings.RememberWFPCompatibilityFailure(status.LastError)
+	if s.logs != nil {
+		s.logs.RecordEvent("wfp_compatibility", "restart_requested", map[string]any{
+			"reason": status.LastError,
+		})
+	}
+	s.mu.Unlock()
+
+	_, stopErr := s.Stop()
+	_, startErr := s.Start("tun")
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.compatRestarting = false
+	if stopErr != nil || startErr != nil {
+		s.compatibilityNotice = "提示：WFP 兼容模式重启失败，聚合已停止；请检查日志后重试"
+		if s.logs != nil {
+			s.logs.RecordEvent("wfp_compatibility", "restart_failed", map[string]any{
+				"stop_error": errorText(stopErr), "start_error": errorText(startErr),
+			})
+		}
+		return
+	}
+	s.compatibilityNotice = "提示：检测到当前设备的 WFP 严格路由不兼容，本次已降级兼容 TUN 并完成一次受控重启"
+	if s.logs != nil {
+		s.logs.RecordEvent("wfp_compatibility", "restart_completed", map[string]any{
+			"reason": status.LastError,
+		})
+	}
+}
+
+func isWFPCompatibilityError(message string) bool {
+	value := strings.ToLower(message)
+	for _, marker := range []string{
+		"wfp", "bfe", "fwpm", "filtering platform", "strict route", "dns leak",
+	} {
+		if strings.Contains(value, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *EngineService) Snapshot() (EngineSnapshot, error) {
+	if phase := s.currentTransition(); phase != "" {
+		settings := s.settings.Get()
+		return EngineSnapshot{
+			Phase: phase, Mode: settings.Mode, Weighted: settings.Weighted, Strategy: effectiveSchedulingStrategy(settings),
+			CoreConnected: s.client.Hello().ProtocolVersion != 0, SampledAt: time.Now(),
+			// Keep the banner truthful while the engine is between phases; the
+			// outage that caused the transition does not pause for it.
+			LinkFailover: s.LinkFailover(),
+		}, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	hello, err := s.client.Ensure(ctx)
+	if err != nil {
+		return EngineSnapshot{}, err
+	}
+	var status engineStatusResult
+	if err := s.client.Request(ctx, "engine.status", nil, &status); err != nil {
+		return EngineSnapshot{}, fmt.Errorf("读取聚合核心状态失败：%w", err)
+	}
+	settings := s.settings.Get()
+	snapshot := EngineSnapshot{
+		Phase: status.Engine.State, Mode: settings.Mode, Weighted: settings.Weighted, Strategy: effectiveSchedulingStrategy(settings), Reason: status.Engine.Reason,
+		CoreConnected: true, CoreVersion: hello.EngineVersion, CoreElevated: hello.Elevated,
+		SampledAt: time.Now(),
+	}
+	s.mu.Lock()
+	if s.compatibilityNotice != "" {
+		snapshot.Reason = s.compatibilityNotice
+	} else if s.runtimeBindingNotice != "" {
+		snapshot.Reason = s.runtimeBindingNotice
+	} else if s.tunConnectivityNotice != "" && status.Engine.State == "running" {
+		snapshot.Reason = s.tunConnectivityNotice
+	} else if s.proxyRecoveryError != "" {
+		snapshot.Reason = "提示：系统代理恢复失败：" + s.proxyRecoveryError
+	} else if s.proxyRecoveryNotice != "" && snapshot.Reason == "" {
+		snapshot.Reason = "提示：" + s.proxyRecoveryNotice
+	}
+	snapshot.IPv4OnlyFallback = s.ipv4OnlyFallback && status.Engine.State == "running"
+	snapshot.Reason = withTUNFallbackNotice(snapshot.Reason, snapshot.IPv4OnlyFallback)
+	if status.Engine.State != "running" {
+		s.last = telemetrySample{}
+		s.lastCDNLog = time.Time{}
+		s.lastPerformanceLog = time.Time{}
+		s.mu.Unlock()
+		return snapshot, nil
+	}
+	s.mu.Unlock()
+	var telemetry telemetryResult
+	if err := s.client.Request(ctx, "engine.telemetry", map[string]any{"include_connections": false}, &telemetry); err != nil {
+		return EngineSnapshot{}, fmt.Errorf("读取聚合遥测失败：%w", err)
+	}
+	s.mu.Lock()
+	logCDN := s.logs != nil && telemetry.SteamCDN.Enabled && time.Since(s.lastCDNLog) >= 10*time.Second
+	if logCDN {
+		s.lastCDNLog = time.Now()
+	}
+	s.mu.Unlock()
+	if logCDN {
+		telemetry.SteamCDN.CoreVersion, telemetry.SteamCDN.CoreCommit = hello.EngineVersion, hello.Commit
+		telemetry.SteamCDN.ConfiguredMode = settings.Mode
+		telemetry.SteamCDN.Available = slices.Contains(hello.Capabilities, "steam_cdn.configure")
+		s.logs.RecordEvent("steam_cdn", "runtime", map[string]any{"status": telemetry.SteamCDN})
+	}
+	snapshot.SampledAt = telemetry.SampledAt
+	snapshot.TCPProfile = telemetry.TCPProfile
+	if telemetry.Scheduling.Strategy != "" {
+		snapshot.Strategy = telemetry.Scheduling.Strategy
+		snapshot.Weighted = snapshot.Strategy == "weighted"
+	}
+	snapshot.Connections = telemetry.Total.Connections
+	snapshot.SessionBytes = telemetry.Total.BytesDown + telemetry.Total.BytesUp
+	s.mu.Lock()
+	s.last.update(telemetry)
+	snapshot.DownloadBPS = s.last.downloadBPS
+	snapshot.UploadBPS = s.last.uploadBPS
+	for _, item := range telemetry.Adapters {
+		runtime := AdapterRuntime{
+			ID: item.Name, Connections: item.Connections, BytesDown: item.BytesDown,
+			BytesUp: item.BytesUp, HealthState: item.HealthState, IPv4Health: item.IPv4Health, IPv6Health: item.IPv6Health,
+		}
+		rates := s.last.adapterRates[item.Name]
+		runtime.DownloadBPS, runtime.UploadBPS = rates[0], rates[1]
+		snapshot.Adapters = append(snapshot.Adapters, runtime)
+	}
+	performanceNow := time.Now()
+	shouldLogPerformance := shouldRecordPerformance(
+		performanceNow,
+		s.lastPerformanceLog,
+		snapshot.DownloadBPS,
+		snapshot.UploadBPS,
+	)
+	if shouldLogPerformance {
+		s.lastPerformanceLog = performanceNow
+	}
+	s.mu.Unlock()
+	if shouldLogPerformance && s.logs != nil {
+		adapters := make([]map[string]any, 0, len(snapshot.Adapters))
+		for _, adapter := range snapshot.Adapters {
+			adapters = append(adapters, map[string]any{
+				"name": adapter.ID, "download_bps": adapter.DownloadBPS,
+				"upload_bps": adapter.UploadBPS, "connections": adapter.Connections,
+				"health": adapter.HealthState,
+			})
+		}
+		s.logs.RecordEvent("performance", "throughput_sample", map[string]any{
+			"rate_unit": "bytes_per_second", "strategy": snapshot.Strategy,
+			"sampled_at": snapshot.SampledAt, "hotspot": hotspotPerformanceFields(s.HotspotStatus()),
+			"tcp_profile": telemetry.TCPProfile, "download_bps": snapshot.DownloadBPS,
+			"udp_profile": telemetry.UDPProfile, "udp_strategy": telemetry.Scheduling.UDPStrategy,
+			"udp_state": telemetry.Scheduling.UDPState, "effective_tcp_strategy": telemetry.Scheduling.EffectiveTCPStrategy,
+			"upload_bps": snapshot.UploadBPS, "connections": snapshot.Connections,
+			"adapters": adapters,
+		})
+	}
+	if s.blockedDomains != nil && settings.BlockedDomainBypass {
+		runtimeEntries := make([]BlockedDomainEntry, 0, len(telemetry.DomainQuarantines))
+		for _, entry := range telemetry.DomainQuarantines {
+			runtimeEntries = append(runtimeEntries, BlockedDomainEntry{
+				Adapter: entry.Adapter, Domain: entry.Domain, ExpiresAt: entry.ExpiresAt,
+			})
+		}
+		_ = s.blockedDomains.ReplaceRuntime(runtimeEntries)
+	}
+	shouldCheckTUN := false
+	s.mu.Lock()
+	if settings.Mode == "tun" && !settings.ForceTUNBypass && time.Since(s.lastTUNHealthCheck) >= 30*time.Second {
+		s.lastTUNHealthCheck = time.Now()
+		shouldCheckTUN = true
+	}
+	s.mu.Unlock()
+	if shouldCheckTUN {
+		s.recordTUNNetworkEnvironment(false)
+		probeContext, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		s.mu.Lock()
+		aggregationEndpoint := s.tunAggregationEndpoint
+		dnsBootstrap := s.tunDNSBootstrap
+		defaultOutbound := s.tunDefaultOutbound
+		s.mu.Unlock()
+		var tunReport tunConnectivityReport
+		var tunErr error
+		if aggregationEndpoint != "" {
+			tunReport, tunErr = probeTUNConnectivityThroughChannels(probeContext, aggregationEndpoint, dnsBootstrap, s.resolveConnectivityDNS)
+			tunReport, tunErr = discountRejectedTUNDataPath(tunReport, tunErr, defaultOutbound)
+		} else {
+			tunErr = errors.New("aggregation channel endpoint is unavailable")
+			tunReport = tunConnectivityReport{Checks: []tunConnectivityCheck{{
+				Stage: "aggregation_data", Endpoint: "aggregation-channel", Outbound: "aggregation", Error: tunErr.Error(),
+			}}}
+		}
+		if s.logs != nil && len(tunReport.Checks) > 0 {
+			s.logs.RecordEvent("tun_connectivity", "watchdog_check", map[string]any{
+				"checks": tunReport.Checks, "error": errorText(tunErr),
+			})
+		}
+		cancel()
+		// Public endpoints and adapter-bound probes can be blocked independently
+		// of user traffic. They are diagnostic evidence, never a stop command.
+		notice := s.recordTUNConnectivityOutcome(tunErr)
+		if notice != "" {
+			snapshot.Reason = withTUNFallbackNotice(notice, snapshot.IPv4OnlyFallback)
+		}
+	}
+	snapshot.LinkFailover = s.LinkFailover()
+	return snapshot, nil
+}
+
+// RepairWFP is an explicit settings action. It never elevates the WebView2
+// host: the installed service is preferred, with the authenticated runas Core
+// retained as the development fallback.
+func (s *EngineService) RepairWFP() (WFPRepairResult, error) {
+	lifecycleCtx, lifecycleCancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer lifecycleCancel()
+	if err := s.acquireLifecycle(lifecycleCtx); err != nil {
+		return WFPRepairResult{}, err
+	}
+	defer s.releaseLifecycle()
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return WFPRepairResult{}, errors.New("Himix 正在退出")
+	}
+	s.mu.Unlock()
+	if hello := s.client.Hello(); hello.ProtocolVersion != 0 {
+		var status engineStatusResult
+		statusCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		statusErr := s.client.Request(statusCtx, "engine.status", nil, &status)
+		cancel()
+		if statusErr == nil && status.Engine.State != "stopped" && status.Engine.State != "failed" {
+			return WFPRepairResult{}, errors.New("请先停止聚合，再修复 WFP/BFE 组件")
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	hello, err := s.client.EnsureElevated(ctx)
+	if err != nil {
+		return WFPRepairResult{}, err
+	}
+	if !hello.Elevated {
+		return WFPRepairResult{}, errors.New("独立聚合核心未获得管理员权限")
+	}
+	var result WFPRepairResult
+	if err := s.client.Request(ctx, "wfp.inspect", map[string]any{"repair": true}, &result); err != nil {
+		_ = s.settings.RememberWFPCompatibilityFailure(err.Error())
+		return result, fmt.Errorf("WFP/BFE 修复失败：%w", err)
+	}
+	if result.EngineReady {
+		_ = s.settings.ClearWFPCompatibilityFailure()
+	} else {
+		_ = s.settings.RememberWFPCompatibilityFailure(result.Detail)
+	}
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	s.client.Shutdown(shutdownCtx)
+	shutdownCancel()
+	return result, nil
+}
+
+func (s *EngineService) Start(mode string) (snapshot EngineSnapshot, returnErr error) {
+	if mode != "proxy" && mode != "tun" {
+		return EngineSnapshot{}, fmt.Errorf("不支持的运行模式：%s", mode)
+	}
+	s.cancelRuntimeBindingRefresh()
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+	defer cancel()
+	if err := s.acquireLifecycle(ctx); err != nil {
+		return EngineSnapshot{}, err
+	}
+	defer s.releaseLifecycle()
+	return s.startLocked(ctx, mode)
+}
+
+// The caller holds lifecycleGate across the whole stop/start transaction.
+func (s *EngineService) startLocked(ctx context.Context, mode string) (snapshot EngineSnapshot, returnErr error) {
+	if err := ctx.Err(); err != nil {
+		return EngineSnapshot{}, err
+	}
+	settings := s.settings.Get()
+	takeOverSystemProxy := shouldTakeOverSystemProxy(mode, settings)
+	s.mu.Lock()
+	s.tunConnectivityNotice = ""
+	s.ipv4OnlyFallback = false
+	if s.closing {
+		s.mu.Unlock()
+		return EngineSnapshot{}, errors.New("Himix 正在退出")
+	}
+	if s.proxyRecoveryError != "" {
+		recoveryError := s.proxyRecoveryError
+		s.mu.Unlock()
+		return EngineSnapshot{}, fmt.Errorf("系统代理状态尚未安全恢复：%s", recoveryError)
+	}
+	if takeOverSystemProxy && s.hostElevated && !s.elevatedProxySafe {
+		detail := s.hostPrivilegeDetail
+		s.mu.Unlock()
+		if detail == "" {
+			detail = "无法验证管理员进程与当前桌面用户属于同一身份"
+		}
+		return EngineSnapshot{}, fmt.Errorf("管理员兼容模式已阻止系统代理：%s；请恢复普通权限后重试", detail)
+	}
+	if !s.compatRestarting && !s.runtimeBindingRefresh {
+		s.dnsFallbackApplied = false
+		s.wfpFallbackApplied = false
+		s.compatibilityNotice = ""
+	}
+	dnsFallbackApplied := s.dnsFallbackApplied
+	wfpFallbackApplied := s.wfpFallbackApplied
+	s.transitionPhase = "starting"
+	s.clashAPI = clashAPIConfig{}
+	s.mu.Unlock()
+	defer s.clearTransition("starting")
+	available, err := s.availableRuntimeAdapters()
+	if err != nil {
+		return EngineSnapshot{}, err
+	}
+	selected := make([]AdapterView, 0, len(available))
+	for _, adapter := range available {
+		if adapter.Selected {
+			selected = append(selected, adapter)
+		}
+	}
+	if len(selected) == 0 {
+		return EngineSnapshot{}, errors.New("请至少选择一张活动网卡")
+	}
+	if err := validateAdapterSources(selected); err != nil {
+		return EngineSnapshot{}, err
+	}
+	routingRules := []RoutingRule{}
+	compatibility := compatibilityPlan{}
+	dnsEgress := tunDNSEgressDecision{}
+	systemDirectEgress := tunDNSEgressDecision{}
+	if mode == "tun" {
+		sourceRules := settings.RoutingRules
+		if err = validateDefaultOutbound(settings.DefaultOutbound, selected); err != nil {
+			return EngineSnapshot{}, err
+		}
+		if validMatchOrder(settings.RoutingMatchOrder) {
+			sourceRules = rulesWithMatchOrder(sourceRules, settings.RoutingMatchOrder)
+		}
+		routingRules, err = normalizeRulesStrict(sourceRules)
+		if err != nil {
+			return EngineSnapshot{}, err
+		}
+		// A NIC that dropped off the machine is not in `selected`, so its rules
+		// would fail validation and block the whole start. Project them onto the
+		// aggregation pool here, before anything is validated or compiled.
+		routingRules = projectRoutingRules(routingRules)
+		if err = validateRoutingOutbounds(routingRules, selected); err != nil {
+			return EngineSnapshot{}, err
+		}
+		if err = validateRuleSetOutbounds(settings.RuleSets, selected); err != nil {
+			return EngineSnapshot{}, err
+		}
+		systemDefaultID, systemDefaultErr := systemDefaultDNSAdapterID()
+		// Snapshot the physical default before starting TUN. A custom DNS
+		// adapter or a user CIDR rule must not move the self-process bypass.
+		systemDirectEgress = resolveAutomaticTUNDNSEgress(selected, nil, systemDefaultID, systemDefaultErr)
+		dnsEgress, err = resolveTUNDNSEgress(
+			settings, selected, routingRules, systemDefaultID, systemDefaultErr,
+		)
+		if err != nil {
+			return EngineSnapshot{}, err
+		}
+		compatibility = detectCompatibilityPlan()
+	}
+	effectiveStrictRoute := settings.StrictRoute && !wfpFallbackApplied
+	effectiveDNSPolicy := settings.DNSPolicy
+	if mode == "tun" && dnsFallbackApplied && settings.DNSPolicy != "dot" && settings.DNSPolicy != "custom" {
+		effectiveDNSPolicy = "off"
+	}
+	logOwned := false
+	if s.logs != nil {
+		names := make([]string, 0, len(selected))
+		for _, adapter := range selected {
+			names = append(names, adapter.Name)
+		}
+		logOwned = s.logs.Start(mode, names, map[string]any{
+			"socks_port":            settings.SOCKSPort,
+			"http_port":             settings.HTTPPort,
+			"system_proxy_takeover": settings.SystemProxyTakeover,
+			"weighted":              settings.Weighted,
+			"strategy":              effectiveSchedulingStrategy(settings),
+			"dns_policy":            settings.DNSPolicy,
+			"dns_egress_mode":       settings.DNSEgressMode,
+		})
+		s.logs.RecordEvent("engine", "start_requested", map[string]any{
+			"mode": mode, "adapters": names,
+		})
+		defer func() {
+			if returnErr == nil {
+				return
+			}
+			s.logs.RecordEvent("engine", "start_failed", map[string]any{"message": returnErr.Error()})
+			if logOwned {
+				s.logs.Finish("start_failed")
+			}
+		}()
+	}
+	if mode == "tun" {
+		if s.logs != nil {
+			s.logs.RecordEvent("tun_dns", "egress_resolved", map[string]any{
+				"mode":       dnsEgress.Mode,
+				"source":     dnsEgress.Source,
+				"adapter_id": dnsEgress.Adapter.ID,
+				"adapter":    dnsEgress.Adapter.Name,
+				"ambiguous":  dnsEgress.Ambiguous,
+				"detail":     dnsEgress.Detail,
+			})
+		}
+		if s.tun == nil {
+			return EngineSnapshot{}, errors.New("TUN 启动前检查服务未注册；系统网络未修改")
+		}
+		preflight, reusedPreflight := s.tun.consumeRecentPreflight(selected)
+		if !reusedPreflight {
+			preflight = s.tun.checkSelected(selected)
+		}
+		effectiveStrictRoute = preflight.EffectiveStrictRoute && !wfpFallbackApplied
+		if s.logs != nil {
+			s.logs.RecordEvent("tun_preflight", "completed", map[string]any{
+				"reused":                     reusedPreflight,
+				"ready":                      preflight.Ready,
+				"host_elevated":              preflight.HostElevated,
+				"privilege_broker_available": preflight.PrivilegeBrokerAvailable,
+				"wfp_ready":                  preflight.WFPReady,
+				"strict_route_requested":     preflight.StrictRouteRequested,
+				"effective_strict_route":     preflight.EffectiveStrictRoute,
+				"foreign_tun":                preflight.ForeignTUN,
+				"shared_gateway_risks":       preflight.SharedGatewayRisks,
+				"network_risks":              preflight.NetworkRisks,
+				"issues":                     preflight.Issues,
+			})
+			s.logs.RecordEvent("tun_compatibility", "resolved", map[string]any{
+				"process_names": compatibility.ProcessNames,
+				"process_paths": compatibility.ProcessPaths,
+				"detected":      compatibility.Detected,
+			})
+		}
+		if blocker := firstTunBlocker(preflight); blocker != nil {
+			return EngineSnapshot{}, fmt.Errorf("TUN 预检阻止启动：%w", blocker)
+		}
+	}
+	var hello engineclient.Hello
+	s.recordStartStage("core_connecting", map[string]any{"elevated": mode == "tun"})
+	if mode == "tun" {
+		hello, err = s.client.EnsureElevated(ctx)
+	} else {
+		hello, err = s.client.Ensure(ctx)
+	}
+	if err != nil {
+		s.recordStartStage("core_connect_failed", map[string]any{
+			"message": err.Error(), "launch": s.client.LastLaunchReport(),
+		})
+		return EngineSnapshot{}, err
+	}
+	if (effectiveSchedulingStrategy(settings) == "adaptive-throughput" || effectiveSchedulingStrategy(settings) == "latency-first") && !slices.Contains(hello.SchedulingStrategies, effectiveSchedulingStrategy(settings)) {
+		return EngineSnapshot{}, errors.New("当前 Core 不支持所选调度策略，请更新核心或选择轮询")
+	}
+	if settings.SteamCDNEnabled && !slices.Contains(hello.Capabilities, "steam_cdn.configure") {
+		return EngineSnapshot{}, errors.New("当前 Core 不支持 Steam 下载优选，请更新核心或关闭此功能")
+	}
+	s.recordStartStage("core_connected", map[string]any{
+		"version": hello.EngineVersion, "elevated": hello.Elevated,
+		"launcher": hello.Launcher, "fallback": hello.Fallback,
+		"launch": s.client.LastLaunchReport(),
+	})
+	if settings.Mode != mode {
+		previousMode := settings.Mode
+		settings.Mode = mode
+		_, err = s.settings.updateHomeStrategy(mode, settings.Weighted, settings.SelectedAdapterIDs, settings.AdapterWeights, effectiveSchedulingStrategy(settings))
+		if err != nil {
+			return EngineSnapshot{}, err
+		}
+		// engine.status, engine.start, the system proxy, TUN activation and the
+		// connectivity probe can all still fail below. Leaving the requested mode
+		// persisted would make the next autostart retry a mode that never came
+		// up, so restore the previously working mode on any failure. This cannot
+		// live in rollback(): several failure paths return before it is defined.
+		defer func() {
+			if returnErr == nil {
+				return
+			}
+			// Re-read rather than reuse the captured settings: UpdateHome writes
+			// mode, weighting and adapter selection together, and the user may
+			// have changed the latter two while this start was in flight.
+			current := s.settings.Get()
+			if _, restoreErr := s.settings.updateHomeStrategy(
+				previousMode, current.Weighted, current.SelectedAdapterIDs, current.AdapterWeights, effectiveSchedulingStrategy(current),
+			); restoreErr != nil && s.logs != nil {
+				s.logs.RecordEvent("engine", "mode_restore_failed", map[string]any{
+					"mode": previousMode, "message": restoreErr.Error(),
+				})
+			}
+		}()
+	}
+	var status engineStatusResult
+	if err := s.client.Request(ctx, "engine.status", nil, &status); err != nil {
+		return EngineSnapshot{}, fmt.Errorf("读取聚合核心启动状态失败：%w", err)
+	}
+	if status.Engine.State == "failed" {
+		var ignored any
+		_ = s.client.Request(ctx, "engine.stop", nil, &ignored)
+	}
+	startPayload := map[string]any{
+		"mode": mode, "listen_host": "127.0.0.1", "weighted": settings.Weighted, "strategy": effectiveSchedulingStrategy(settings),
+		"connect_timeout_ms": 6000,
+		"dns": map[string]any{
+			"policy": effectiveDNSPolicy, "legacy_servers": settingsDNSServers(settings), "doh_servers": settings.DoHServers, "dot_servers": settings.DoTServers,
+			"cache_ttl_ms": 60000, "query_timeout_ms": 4000,
+		},
+		"adapters":                engineAdapters(selected),
+		"steam_cdn_enabled":       settings.SteamCDNEnabled,
+		"domain_isolation":        settings.BlockedDomainBypass,
+		"domain_isolation_expiry": settings.BlockedDomainExpiry,
+	}
+	if settings.BlockedDomainBypass && s.blockedDomains != nil {
+		if snapshot, snapshotErr := s.blockedDomains.List(); snapshotErr == nil {
+			seeds := make([]map[string]any, 0, len(snapshot.Entries))
+			for _, entry := range snapshot.Entries {
+				expiresAt := entry.ExpiresAt
+				if entry.Permanent {
+					expiresAt = time.Now().AddDate(100, 0, 0)
+				}
+				seeds = append(seeds, map[string]any{
+					"adapter": entry.Adapter, "domain": entry.Domain, "expires_at": expiresAt,
+				})
+			}
+			startPayload["domain_quarantines"] = seeds
+		}
+	}
+	if mode == "proxy" {
+		startPayload["mode"] = "proxy"
+		startPayload["socks_port"] = settings.SOCKSPort
+		startPayload["http_port"] = settings.HTTPPort
+	} else {
+		startPayload["mode"] = "tun_tcp_pool"
+		startPayload["channels"] = engineChannels(selected)
+	}
+	var started engineStartResult
+	s.recordStartStage("engine_starting", nil)
+	if err := s.client.Request(ctx, "engine.start", startPayload, &started); err != nil {
+		return EngineSnapshot{}, fmt.Errorf("启动聚合核心失败：%w", err)
+	}
+	s.recordStartStage("engine_started", nil)
+	rollback := func(cause error) (EngineSnapshot, error) {
+		// Startup may fail because its 75-second transaction has already
+		// expired. Recovery must not reuse that cancelled context or the Core
+		// never receives tun.deactivate/engine.stop, leaving network ownership
+		// behind while the UI claims it was restored.
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cleanupCancel()
+		cleanupFailures := make([]error, 0, 3)
+		recordCleanupFailure := func(stage string, cleanupErr error) {
+			if cleanupErr == nil {
+				return
+			}
+			var remote *engineclient.RemoteError
+			if errors.As(cleanupErr, &remote) && remote.Code == "invalid_state" {
+				return
+			}
+			cleanupFailures = append(cleanupFailures, fmt.Errorf("%s：%w", stage, cleanupErr))
+		}
+		var ignored any
+		var tunIgnored tunLifecycleResult
+		recordCleanupFailure(
+			"停止虚拟网卡失败",
+			s.client.Request(cleanupCtx, "tun.deactivate", nil, &tunIgnored),
+		)
+		recordCleanupFailure(
+			"停止聚合核心失败",
+			s.client.Request(cleanupCtx, "engine.stop", nil, &ignored),
+		)
+		if restoreErr := restoreSystemProxy(); restoreErr != nil {
+			cleanupFailures = append(cleanupFailures, fmt.Errorf("恢复系统代理失败：%w", restoreErr))
+		}
+		s.mu.Lock()
+		s.clashAPI = clashAPIConfig{}
+		s.tunAggregationEndpoint = ""
+		s.tunDNSBootstrap = dnsResolveResult{}
+		s.tunDefaultOutbound = ""
+		s.mu.Unlock()
+		if len(cleanupFailures) > 0 {
+			cause = fmt.Errorf("%w；启动失败后的网络回滚不完整：%v", cause, errors.Join(cleanupFailures...))
+		}
+		return EngineSnapshot{}, cause
+	}
+	if mode == "proxy" {
+		if takeOverSystemProxy {
+			if err := enableSystemProxy(settings.HTTPPort, settings.SOCKSPort); err != nil {
+				return rollback(err)
+			}
+		} else if s.logs != nil {
+			s.logs.RecordEvent("system_proxy", "takeover_skipped", map[string]any{
+				"http_port": settings.HTTPPort, "socks_port": settings.SOCKSPort,
+			})
+		}
+	} else {
+		s.recordStartStage("dns_preparing", nil)
+		useDNSPool := effectiveDNSPolicy != "system" && (len(settings.DNSServers) > 1 || len(settings.DoHServers) > 0 || effectiveDNSPolicy == "custom" || effectiveDNSPolicy == "dot")
+		var prepared preparedTUNDNS
+		var dnsErr error
+		if settings.ForceTUNBypass {
+			prepared, dnsErr = s.prepareTUNDNSAdapter(ctx, dnsEgress.Adapter, true, useDNSPool)
+		} else {
+			dnsEgress, prepared, dnsErr = prepareTUNDNSEgress(ctx, dnsEgress, selected,
+				func(probeCtx context.Context, adapter AdapterView) (preparedTUNDNS, error) {
+					return s.prepareTUNDNSAdapter(probeCtx, adapter, false, useDNSPool)
+				}, func(candidate tunDNSEgressDecision, probeErr error) {
+					if s.logs != nil {
+						s.logs.RecordEvent("tun_dns", "egress_probe", map[string]any{
+							"adapter": candidate.Adapter.Name, "adapter_id": candidate.Adapter.ID,
+							"source": candidate.Source, "verified": probeErr == nil, "error": errorText(probeErr),
+						})
+					}
+				})
+		}
+		if dnsErr != nil {
+			return rollback(fmt.Errorf("准备 TUN DNS 配置失败：%w", dnsErr))
+		}
+		dnsResult, dnsPool := prepared.Result, prepared.Pool
+		s.recordStartStage("dns_prepared", map[string]any{
+			"adapter": dnsEgress.Adapter.Name, "policy": effectiveDNSPolicy,
+			"transport": dnsResult.Transport, "server": dnsResult.Server,
+			"force_start": settings.ForceTUNBypass, "egress_source": dnsEgress.Source,
+		})
+		tunAddress, addressErr := availableTunIPv4Address(settings.ForceTUNBypass)
+		if addressErr != nil {
+			return rollback(addressErr)
+		}
+		if s.logs != nil {
+			s.logs.RecordEvent("tun_address", "selected", map[string]any{"ipv4": tunAddress})
+		}
+		configOptions := tunConfigOptions{
+			DefaultOutbound:     settings.DefaultOutbound,
+			ForceStart:          settings.ForceTUNBypass,
+			IPv4Address:         tunAddress,
+			Stack:               settings.TUNStack,
+			DNSPolicy:           effectiveDNSPolicy,
+			IPv6Available:       selectedAdaptersHaveIPv6(selected),
+			IPv4Unavailable:     !selectedAdaptersHaveIPv4(selected),
+			ConfigName:          "sing-box.json",
+			RuleSets:            settings.RuleSets,
+			DNSUpstreams:        dnsPool,
+			SystemDirectAdapter: &systemDirectEgress.Adapter,
+		}
+		configDigest := ""
+		configOptions.ConfigSHA256 = &configDigest
+		singBox, configPath, clashAPI, configErr := writeSingBoxConfigWithOptions(
+			started.Endpoints.Channels, dnsEgress.Adapter, dnsResult, routingRules, compatibility,
+			effectiveStrictRoute, configOptions,
+		)
+		if configErr != nil {
+			return rollback(configErr)
+		}
+		if configDigest == "" {
+			return rollback(errors.New("固定 TUN 配置摘要失败"))
+		}
+		ipv4FallbackPath := ""
+		ipv4FallbackDigest := ""
+		if configOptions.IPv6Available && !configOptions.IPv4Unavailable {
+			fallbackOptions := configOptions
+			fallbackOptions.IPv6Available = false
+			fallbackOptions.ConfigName = "sing-box-ipv4.json"
+			fallbackOptions.ClashAPI = &clashAPI
+			fallbackOptions.ConfigSHA256 = &ipv4FallbackDigest
+			_, ipv4FallbackPath, _, configErr = writeSingBoxConfigWithOptions(
+				started.Endpoints.Channels, dnsEgress.Adapter, dnsResult, routingRules, compatibility,
+				effectiveStrictRoute, fallbackOptions,
+			)
+			if configErr != nil {
+				return rollback(configErr)
+			}
+			if ipv4FallbackDigest == "" {
+				return rollback(errors.New("固定 IPv4 TUN 配置摘要失败"))
+			}
+		}
+		if s.logs != nil {
+			s.logs.RecordEvent("tun_egress", "system_direct_bound", map[string]any{
+				"adapter": systemDirectEgress.Adapter.Name,
+				"source":  systemDirectEgress.Source,
+				"ipv4":    systemDirectEgress.Adapter.Address,
+				"ipv6":    systemDirectEgress.Adapter.SourceIPv6,
+			})
+			s.logs.RecordEvent("tun_dns", "upstream_selected", map[string]any{
+				"policy":             effectiveDNSPolicy,
+				"egress_mode":        dnsEgress.Mode,
+				"egress_source":      dnsEgress.Source,
+				"adapter_id":         dnsEgress.Adapter.ID,
+				"adapter":            dnsEgress.Adapter.Name,
+				"transport":          dnsResult.Transport,
+				"server":             dnsResult.Server,
+				"route_exclusions":   tunRouteExclusions(dnsResult, effectiveDNSPolicy, configOptions.IPv6Available),
+				"ipv6_available":     configOptions.IPv6Available,
+				"tun_stack":          configOptions.Stack,
+				"ipv4_fallback_file": ipv4FallbackPath,
+			})
+		}
+		var activated tunLifecycleResult
+		s.recordStartStage("tun_activating", nil)
+		if err := s.client.Request(ctx, "tun.activate", map[string]any{
+			"executable":                singBox,
+			"config_path":               configPath,
+			"config_sha256":             configDigest,
+			"ipv4_fallback_config_path": ipv4FallbackPath,
+			"ipv4_fallback_sha256":      ipv4FallbackDigest,
+			"startup_timeout_ms":        20000,
+			"strict_route":              effectiveStrictRoute,
+		}, &activated); err != nil {
+			if !hello.Elevated {
+				return rollback(fmt.Errorf("TUN 需要管理员权限的独立聚合核心：%w", err))
+			}
+			return rollback(fmt.Errorf("启动 TUN 侧车失败：%w", err))
+		}
+		s.recordStartStage("tun_activated", nil)
+		if activated.RecoveredStaleAdapter && s.logs != nil {
+			s.logs.RecordEvent("tun_compatibility", "stale_adapter_recovered", map[string]any{
+				"adapter": "Himix-Tun",
+			})
+		}
+		s.mu.Lock()
+		s.ipv4OnlyFallback = activated.IPv4OnlyFallback
+		s.mu.Unlock()
+		if activated.IPv4OnlyFallback && s.logs != nil {
+			s.logs.RecordEvent("tun_compatibility", "ipv4_only_fallback", map[string]any{
+				"reason": "sing-box could not configure the IPv6 TUN address",
+			})
+		}
+		if activated.Tun.State != "running" {
+			return rollback(fmt.Errorf("TUN 未进入稳定运行状态：%s", activated.Tun.LastError))
+		}
+		s.mu.Lock()
+		s.clashAPI = clashAPI
+		s.tunAggregationEndpoint = started.Endpoints.Channels["aggregation"]
+		s.tunDNSBootstrap = dnsResult
+		s.tunDefaultOutbound = settings.DefaultOutbound
+		s.mu.Unlock()
+		s.recordTUNNetworkEnvironment(true)
+		if effectiveStrictRoute {
+			_ = s.settings.ClearWFPCompatibilityFailure()
+		}
+		if !settings.ForceTUNBypass {
+			s.recordStartStage("connectivity_validating", nil)
+			validationReport, validationErr := probeTUNConnectivityThroughChannels(
+				ctx, started.Endpoints.Channels["aggregation"], dnsResult, s.resolveConnectivityDNS,
+			)
+			validationReport, validationErr = discountRejectedTUNDataPath(validationReport, validationErr, settings.DefaultOutbound)
+			s.recordTUNConnectivityOutcome(validationErr)
+			event := "startup_validated"
+			if validationErr != nil {
+				event = "startup_unverified"
+			}
+			if s.logs != nil {
+				s.logs.RecordEvent("tun_connectivity", event, map[string]any{
+					"checks": validationReport.Checks, "detail": validationReport.summary(),
+					"error": errorText(validationErr),
+				})
+			}
+			s.recordStartStage("connectivity_checked", map[string]any{"verified": validationErr == nil})
+		} else if s.logs != nil {
+			s.logs.RecordEvent("tun_connectivity", "startup_bypassed", nil)
+		}
+	}
+	s.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		s.mu.Unlock()
+		return rollback(err)
+	}
+	s.last = telemetrySample{}
+	s.lastCDNLog = time.Time{}
+	s.lastPerformanceLog = time.Time{}
+	s.lastTUNHealthCheck = time.Now()
+	s.rememberRuntimeBindingsLocked(mode, selected, dnsEgress.Adapter)
+	connectivityNotice := s.tunConnectivityNotice
+	s.mu.Unlock()
+	if s.logs != nil {
+		s.logs.RecordEvent("engine", "started", map[string]any{
+			"mode": mode, "core_version": hello.EngineVersion, "elevated": hello.Elevated,
+			"effective_dns_policy": effectiveDNSPolicy,
+		})
+	}
+	return EngineSnapshot{
+		Phase: "running", Reason: connectivityNotice, Mode: mode, Weighted: settings.Weighted, Strategy: effectiveSchedulingStrategy(settings), CoreConnected: true,
+		CoreVersion: hello.EngineVersion, CoreElevated: hello.Elevated, SampledAt: time.Now(),
+	}, nil
+}
+
+func shouldRecordPerformance(
+	now time.Time,
+	last time.Time,
+	downloadBPS float64,
+	uploadBPS float64,
+) bool {
+	const minimumThroughput = 10 * 1024 * 1024
+	if downloadBPS+uploadBPS < minimumThroughput {
+		return false
+	}
+	return last.IsZero() || now.Sub(last) >= 5*time.Second
+}
+
+func (s *EngineService) recordStartStage(stage string, fields map[string]any) {
+	if s.logs != nil {
+		s.logs.RecordEvent("engine_start", stage, fields)
+	}
+}
+
+func (s *EngineService) acquireLifecycle(ctx context.Context) error {
+	select {
+	case s.lifecycleGate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("等待 Core 生命周期操作超时：%w", ctx.Err())
+	}
+}
+
+func (s *EngineService) releaseLifecycle() {
+	<-s.lifecycleGate
+}
+
+func (s *EngineService) currentTransition() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.transitionPhase
+}
+
+func (s *EngineService) clearTransition(expected string) {
+	s.mu.Lock()
+	if s.transitionPhase == expected {
+		s.transitionPhase = ""
+	}
+	s.mu.Unlock()
+}
+
+func (s *EngineService) Stop() (EngineSnapshot, error) {
+	s.cancelRuntimeBindingRefresh()
+	s.cancelHotspotStart()
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+	defer cancel()
+	if err := s.acquireLifecycle(ctx); err != nil {
+		return EngineSnapshot{}, err
+	}
+	defer s.releaseLifecycle()
+	return s.stopLocked(ctx)
+}
+
+func (s *EngineService) stopLocked(ctx context.Context) (EngineSnapshot, error) {
+	// Release hotspot sharing while its TUN connection profile still exists.
+	hotspotCtx, hotspotCancel := context.WithTimeout(ctx, 45*time.Second)
+	hotspotErr := s.stopHotspot(hotspotCtx)
+	hotspotCancel()
+	s.mu.Lock()
+	s.transitionPhase = "stopping"
+	s.mu.Unlock()
+	defer s.clearTransition("stopping")
+	if s.logs != nil {
+		s.logs.RecordEvent("engine", "stop_requested", nil)
+	}
+	hello, ensureErr := s.client.Ensure(ctx)
+	var firstError error
+	if ensureErr == nil {
+		if slices.Contains(hello.Capabilities, "steam_cdn.configure") && s.logs != nil {
+			var status SteamCDNStatus
+			if err := s.client.Request(ctx, "steam_cdn.configure", map[string]any{}, &status); err == nil {
+				status.CoreVersion, status.CoreCommit = hello.EngineVersion, hello.Commit
+				status.ConfiguredMode, status.Available = s.settings.Get().Mode, true
+				s.logs.RecordEvent("steam_cdn", "before_stop", map[string]any{"status": status})
+			}
+		}
+		var tunResult tunLifecycleResult
+		if err := s.client.Request(ctx, "tun.deactivate", nil, &tunResult); err != nil {
+			var remote *engineclient.RemoteError
+			if !errors.As(err, &remote) || remote.Code != "invalid_state" {
+				firstError = fmt.Errorf("停止 TUN 失败：%w", err)
+			}
+		}
+		var stopResult any
+		if err := s.client.Request(ctx, "engine.stop", nil, &stopResult); err != nil {
+			var remote *engineclient.RemoteError
+			if !errors.As(err, &remote) || remote.Code != "invalid_state" {
+				if firstError == nil {
+					firstError = fmt.Errorf("停止聚合核心失败：%w", err)
+				}
+			}
+		}
+	}
+	if err := restoreSystemProxy(); err != nil && firstError == nil {
+		firstError = err
+	}
+	s.mu.Lock()
+	s.last = telemetrySample{}
+	s.lastCDNLog = time.Time{}
+	s.lastPerformanceLog = time.Time{}
+	s.clashAPI = clashAPIConfig{}
+	s.tunAggregationEndpoint = ""
+	s.tunDNSBootstrap = dnsResolveResult{}
+	s.tunDefaultOutbound = ""
+	// An automatic restart owns a recovery intent until startup succeeds.
+	// Keep it across cleanup/start failures; explicit Stop cancels it first.
+	if s.runtimeBindingRecovery == nil || !s.runtimeBindingEnabled {
+		s.runtimeBindings = nil
+		s.runtimeBindingMode = ""
+		s.runtimeBindingEnabled = false
+		s.runtimeBindingRecovery = nil
+		s.runtimeBindingNotice = ""
+	}
+	if !s.compatRestarting && !s.runtimeBindingRefresh {
+		s.dnsFallbackApplied = false
+		s.wfpFallbackApplied = false
+		s.compatibilityNotice = ""
+	}
+	// A stopped session must not carry its failover view into the next start:
+	// rules would stay projected and the banner would describe an outage the
+	// fresh session has never seen.
+	s.linkDegraded = false
+	s.linkLossSignature = ""
+	s.linkDefaultEgressStale = false
+	s.linkLostAdapters = nil
+	s.linkActiveAdapters = nil
+	s.linkSwitchAt = time.Time{}
+	s.linkRecoverSince = time.Time{}
+	s.mu.Unlock()
+	liveOutbounds.replace(nil)
+	if ensureErr != nil && firstError == nil {
+		firstError = ensureErr
+	}
+	snapshot := EngineSnapshot{
+		Phase: "stopped", Mode: s.settings.Get().Mode, Weighted: s.settings.Get().Weighted, Strategy: effectiveSchedulingStrategy(s.settings.Get()), CoreConnected: ensureErr == nil,
+		CoreVersion: hello.EngineVersion, CoreElevated: hello.Elevated, SampledAt: time.Now(),
+	}
+	if s.logs != nil {
+		fields := map[string]any{}
+		reason := "stopped"
+		if firstError != nil {
+			fields["message"] = firstError.Error()
+			reason = "stop_error"
+		}
+		s.logs.RecordEvent("engine", reason, fields)
+		s.logs.Finish(reason)
+	}
+	return snapshot, errors.Join(firstError, hotspotErr)
+}
+
+func (s *EngineService) Shutdown() {
+	s.mu.Lock()
+	s.closing = true
+	s.mu.Unlock()
+	_, _ = s.Stop()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s.client.Shutdown(ctx)
+	s.client.Close()
+	if s.bindingMonitorDone != nil {
+		<-s.bindingMonitorDone
+	}
+}
+
+func errorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func engineAdapters(adapters []AdapterView) []map[string]any {
+	result := make([]map[string]any, 0, len(adapters))
+	for _, adapter := range adapters {
+		result = append(result, map[string]any{
+			"name": adapter.Name, "source_ip": adapter.Address, "if_index": adapter.IfIndex,
+			"source_ipv6": adapter.SourceIPv6, "ipv6_if_index": adapter.IPv6IfIndex,
+			"weight": adapter.Weight, "dns_servers": adapter.DNSServers,
+		})
+	}
+	return result
+}
+
+func selectedAdaptersHaveIPv6(adapters []AdapterView) bool {
+	for _, adapter := range adapters {
+		if strings.TrimSpace(adapter.SourceIPv6) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func selectedAdaptersHaveIPv4(adapters []AdapterView) bool {
+	for _, adapter := range adapters {
+		if strings.TrimSpace(adapter.Address) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func engineChannels(adapters []AdapterView) []map[string]any {
+	all, wired, wireless := []string{}, []string{}, []string{}
+	for _, adapter := range adapters {
+		all = append(all, adapter.Name)
+		if adapter.Kind == "wifi" {
+			wireless = append(wireless, adapter.Name)
+		} else {
+			wired = append(wired, adapter.Name)
+		}
+	}
+	if len(wired) == 0 {
+		wired = append([]string(nil), all...)
+	}
+	if len(wireless) == 0 {
+		wireless = append([]string(nil), all...)
+	}
+	channels := []map[string]any{
+		{"name": "nic_ethernet", "port": 0, "adapter_names": wired},
+		{"name": "nic_wifi", "port": 0, "adapter_names": wireless},
+		{"name": "aggregation", "port": 0, "adapter_names": all},
+		{"name": "direct", "port": 0, "adapter_names": []string{}},
+	}
+	for _, adapter := range adapters {
+		channels = append(channels, map[string]any{
+			"name": "nic_" + adapter.Name, "port": 0, "adapter_names": []string{adapter.Name},
+		})
+	}
+	return channels
+}
+
+func max64(a int64, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}

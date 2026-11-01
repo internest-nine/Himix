@@ -1,0 +1,527 @@
+//go:build windows
+
+package engineclient
+
+import (
+	"bufio"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
+)
+
+const (
+	sessionProtocol        = 2
+	sessionAuthKind        = "himix.core.authenticate"
+	sessionReadyKind       = "himix.host.ready"
+	seeMaskNoCloseProcess  = 0x00000040
+	maxSessionMessageBytes = 4096
+	// coreTerminateWait bounds how long a failed launch waits for the core
+	// process to exit before giving up (see privilegedLauncher.Launch).
+	coreTerminateWait = 5 * time.Second
+	// sessionAuthTimeout bounds the wait for the core's authentication message
+	// when the caller's context carries no deadline. Launch must never wait
+	// indefinitely, and the reader goroutine must not depend on Close alone to
+	// wake it up.
+	sessionAuthTimeout = 30 * time.Second
+)
+
+var ErrElevationCancelled = errors.New("用户取消了管理员权限请求")
+
+type privilegedLauncher struct{}
+
+type sessionAuthMessage struct {
+	Protocol int    `json:"protocol"`
+	Kind     string `json:"kind"`
+}
+
+type sessionReadyMessage struct {
+	Protocol int    `json:"protocol"`
+	Kind     string `json:"kind"`
+	OK       bool   `json:"ok"`
+	Error    string `json:"error,omitempty"`
+}
+
+type namedPipeServer struct {
+	handle windows.Handle
+	name   string
+}
+
+type shellExecuteInfo struct {
+	Size        uint32
+	Mask        uint32
+	Window      windows.Handle
+	Verb        *uint16
+	File        *uint16
+	Parameters  *uint16
+	Directory   *uint16
+	Show        int32
+	Instance    windows.Handle
+	IDList      uintptr
+	Class       *uint16
+	ClassKey    windows.Handle
+	HotKey      uint32
+	IconMonitor windows.Handle
+	Process     windows.Handle
+}
+
+type windowsCoreProcess struct {
+	handle windows.Handle
+	pid    int
+	mu     sync.Mutex
+	once   sync.Once
+}
+
+func newPrivilegedLauncher() coreLauncher {
+	return serviceFirstLauncher{
+		service:                    windowsServiceLauncher{},
+		fallback:                   privilegedLauncher{},
+		allowAutomaticFallbackPath: allowAutomaticCoreFallbackPath,
+		allowPostHandshakeFallback: allowServicePostHandshakeFallback,
+	}
+}
+
+func PrivilegedLaunchSupported() bool {
+	return true
+}
+
+func (privilegedLauncher) Launch(ctx context.Context, path string) (*coreSession, error) {
+	pipe, err := createAuthenticatedPipe()
+	if err != nil {
+		return nil, fmt.Errorf("创建高权限核心通信通道失败：%w", err)
+	}
+	defer pipe.close()
+
+	process, err := launchElevatedCore(path, pipe.name)
+	if err != nil {
+		return nil, err
+	}
+	connection, err := pipe.accept(ctx, process.pid, path)
+	if err != nil {
+		// The desktop cannot terminate an elevated process (ACCESS_DENIED) and
+		// a wedged core may never exit on its own. Never wait indefinitely
+		// here: the startGate slot would stay occupied and every future Ensure
+		// call would time out until the desktop restarts.
+		_ = process.Kill()
+		_ = process.waitTimeout(coreTerminateWait)
+		return nil, fmt.Errorf("验证高权限核心通信失败：%w", err)
+	}
+	return &coreSession{
+		reader:  connection,
+		writer:  connection,
+		close:   connection.Close,
+		process: process,
+		path:    path,
+		source:  coreSourceRunAs,
+	}, nil
+}
+
+func createAuthenticatedPipe() (*namedPipeServer, error) {
+	random := make([]byte, 24)
+	if _, err := io.ReadFull(rand.Reader, random); err != nil {
+		return nil, err
+	}
+	// The pipe name is not a secret: the session is authenticated by mutual
+	// process pinning (the host checks the client PID and image, the elevated
+	// core checks the pipe server image), so no credential travels on a
+	// command line that same-user processes can read.
+	name := `\\.\pipe\Himix-Core-` + hex.EncodeToString(random)
+
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		return nil, fmt.Errorf("读取当前用户 SID：%w", err)
+	}
+	descriptor, err := windows.SecurityDescriptorFromString(
+		"D:P(A;;GA;;;" + user.User.Sid.String() + ")(A;;GA;;;BA)(A;;GA;;;SY)",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("创建命名管道安全描述符：%w", err)
+	}
+	attributes := windows.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
+		SecurityDescriptor: descriptor,
+	}
+	namePointer, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		return nil, err
+	}
+	handle, err := windows.CreateNamedPipe(
+		namePointer,
+		windows.PIPE_ACCESS_DUPLEX|windows.FILE_FLAG_FIRST_PIPE_INSTANCE|windows.FILE_FLAG_OVERLAPPED,
+		windows.PIPE_TYPE_BYTE|windows.PIPE_READMODE_BYTE|windows.PIPE_WAIT|windows.PIPE_REJECT_REMOTE_CLIENTS,
+		1,
+		64*1024,
+		64*1024,
+		0,
+		&attributes,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &namedPipeServer{handle: handle, name: name}, nil
+}
+
+func (p *namedPipeServer) accept(ctx context.Context, expectedPID int, expectedPath string) (pipeFile, error) {
+	if err := connectAuthenticatedPipeServer(ctx, p.handle); err != nil {
+		return nil, err
+	}
+
+	var clientPID uint32
+	if err := windows.GetNamedPipeClientProcessId(p.handle, &clientPID); err != nil {
+		return nil, fmt.Errorf("读取核心进程身份：%w", err)
+	}
+	if expectedPID <= 0 || clientPID != uint32(expectedPID) {
+		return nil, fmt.Errorf("拒绝非预期核心进程（PID %d）", clientPID)
+	}
+	// A PID is reused by unrelated processes; pin the connecting process to
+	// the executable that was actually elevated before trusting the session.
+	if err := verifyCoreProcessImage(clientPID, expectedPath); err != nil {
+		return nil, err
+	}
+
+	connection, err := newPipeFile(p.handle)
+	p.handle = windows.InvalidHandle
+	if err != nil {
+		return nil, fmt.Errorf("创建命名管道连接失败：%w", err)
+	}
+	if err := authenticateCore(ctx, connection); err != nil {
+		_ = connection.Close()
+		return nil, err
+	}
+	return connection, nil
+}
+
+func connectAuthenticatedPipeServer(ctx context.Context, handle windows.Handle) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	event, err := windows.CreateEvent(nil, 1, 0, nil)
+	if err != nil {
+		return fmt.Errorf("创建核心管道连接事件失败：%w", err)
+	}
+	defer windows.CloseHandle(event)
+	overlapped := windows.Overlapped{HEvent: event}
+	err = windows.ConnectNamedPipe(handle, &overlapped)
+	if err == nil || errors.Is(err, windows.ERROR_PIPE_CONNECTED) {
+		return nil
+	}
+	if !errors.Is(err, windows.ERROR_IO_PENDING) {
+		return fmt.Errorf("连接高权限核心管道失败：%w", err)
+	}
+	for {
+		result, waitErr := windows.WaitForSingleObject(event, 50)
+		if waitErr != nil {
+			return fmt.Errorf("等待高权限核心连接失败：%w", waitErr)
+		}
+		switch result {
+		case windows.WAIT_OBJECT_0:
+			var transferred uint32
+			if err := windows.GetOverlappedResult(handle, &overlapped, &transferred, false); err != nil {
+				return fmt.Errorf("完成高权限核心连接失败：%w", err)
+			}
+			return nil
+		case uint32(windows.WAIT_TIMEOUT):
+			if ctx.Err() == nil {
+				continue
+			}
+			_ = windows.CancelIoEx(handle, &overlapped)
+			var transferred uint32
+			_ = windows.GetOverlappedResult(handle, &overlapped, &transferred, true)
+			return ctx.Err()
+		default:
+			return fmt.Errorf("等待高权限核心连接返回 0x%X", result)
+		}
+	}
+}
+
+func authenticateCore(ctx context.Context, connection pipeFile) error {
+	// The pipe handle is overlapped, so the deadline is honoured by the
+	// netpoller and ReadBytes below cannot block past it. Without this the
+	// goroutine's only escape is the Close in the ctx.Done() branch, and a Close
+	// that fails strands it for the lifetime of the process. If the handle ever
+	// turns out not to be pollable this is a no-op and behaviour is unchanged.
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(sessionAuthTimeout)
+	}
+	_ = connection.SetReadDeadline(deadline)
+
+	result := make(chan error, 1)
+	go func() {
+		reader := bufio.NewReaderSize(connection, maxSessionMessageBytes)
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			result <- err
+			return
+		}
+		if len(line) > maxSessionMessageBytes {
+			result <- errors.New("核心身份消息过长")
+			return
+		}
+		var auth sessionAuthMessage
+		if err := json.Unmarshal(line, &auth); err != nil {
+			result <- errors.New("核心身份消息无效")
+			return
+		}
+		if auth.Protocol != sessionProtocol || auth.Kind != sessionAuthKind {
+			_ = writeSessionMessage(connection, sessionReadyMessage{
+				Protocol: sessionProtocol,
+				Kind:     sessionReadyKind,
+				OK:       false,
+				Error:    "authentication_failed",
+			})
+			result <- errors.New("核心身份协议不匹配")
+			return
+		}
+		result <- writeSessionMessage(connection, sessionReadyMessage{
+			Protocol: sessionProtocol,
+			Kind:     sessionReadyKind,
+			OK:       true,
+		})
+	}()
+	select {
+	case err := <-result:
+		if err == nil {
+			// Authentication's deadline must not expire the long-lived RPC
+			// transport that takes ownership of this connection next.
+			return connection.SetReadDeadline(time.Time{})
+		}
+		return err
+	case <-ctx.Done():
+		_ = connection.Close()
+		return ctx.Err()
+	}
+}
+
+func writeSessionMessage(writer io.Writer, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	_, err = writer.Write(append(data, '\n'))
+	return err
+}
+
+func processImagePath(processID uint32) (string, error) {
+	process, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, processID)
+	if err != nil {
+		return "", fmt.Errorf("读取核心进程身份（PID %d）：%w", processID, err)
+	}
+	defer windows.CloseHandle(process)
+	buffer := make([]uint16, 32768)
+	size := uint32(len(buffer))
+	if err := windows.QueryFullProcessImageName(process, 0, &buffer[0], &size); err != nil {
+		return "", fmt.Errorf("读取核心可执行文件（PID %d）：%w", processID, err)
+	}
+	if size == 0 {
+		return "", fmt.Errorf("核心进程 PID %d 没有可执行文件路径", processID)
+	}
+	return windows.UTF16ToString(buffer[:size]), nil
+}
+
+// canonicalFilePath resolves a path through the file system so reparse points
+// and aliasing cannot disguise a different executable behind the expected name.
+func canonicalFilePath(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("核心可执行文件不是常规文件：%s", path)
+	}
+	size := uint32(512)
+	for size <= 32768 {
+		buffer := make([]uint16, size)
+		length, err := windows.GetFinalPathNameByHandle(windows.Handle(file.Fd()), &buffer[0], size, 0)
+		if err != nil {
+			return "", err
+		}
+		if length < size {
+			canonical := windows.UTF16ToString(buffer[:length])
+			switch {
+			case strings.HasPrefix(canonical, `\\?\UNC\`):
+				canonical = `\\` + strings.TrimPrefix(canonical, `\\?\UNC\`)
+			case strings.HasPrefix(canonical, `\\?\`):
+				canonical = strings.TrimPrefix(canonical, `\\?\`)
+			}
+			if strings.TrimSpace(canonical) == "" {
+				return "", errors.New("canonical path is empty")
+			}
+			return filepath.Clean(canonical), nil
+		}
+		size = length + 1
+	}
+	return "", errors.New("canonical path exceeds the Windows path limit")
+}
+
+func verifyCoreProcessImage(processID uint32, expectedPath string) error {
+	actual, err := processImagePath(processID)
+	if err != nil {
+		return err
+	}
+	actualCanonical, err := canonicalFilePath(actual)
+	if err != nil {
+		return err
+	}
+	expectedCanonical, err := canonicalFilePath(expectedPath)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(actualCanonical, expectedCanonical) {
+		return fmt.Errorf("拒绝非预期核心可执行文件（PID %d）", processID)
+	}
+	return nil
+}
+
+func launchElevatedCore(path, pipeName string) (*windowsCoreProcess, error) {
+	verb, _ := windows.UTF16PtrFromString("runas")
+	file, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, err
+	}
+	// The pipe name is not a secret: the session is authenticated by mutual
+	// process pinning (the host checks the client PID and image, the elevated
+	// core checks the pipe server image), so no credential travels on a
+	// command line that same-user processes can read.
+	parameters := "serve-pipe --pipe " + pipeName
+	parameterPointer, err := windows.UTF16PtrFromString(parameters)
+	if err != nil {
+		return nil, err
+	}
+	directory, err := windows.UTF16PtrFromString(filepathDir(path))
+	if err != nil {
+		return nil, err
+	}
+	info := shellExecuteInfo{
+		Mask:       seeMaskNoCloseProcess,
+		Verb:       verb,
+		File:       file,
+		Parameters: parameterPointer,
+		Directory:  directory,
+		Show:       0,
+	}
+	info.Size = uint32(unsafe.Sizeof(info))
+	procedure := windows.NewLazySystemDLL("shell32.dll").NewProc("ShellExecuteExW")
+	result, _, callErr := procedure.Call(uintptr(unsafe.Pointer(&info)))
+	if result == 0 {
+		if errors.Is(callErr, windows.ERROR_CANCELLED) || errors.Is(callErr, syscall.Errno(windows.ERROR_CANCELLED)) {
+			return nil, ErrElevationCancelled
+		}
+		return nil, fmt.Errorf("启动管理员核心失败：%w", callErr)
+	}
+	if info.Process == 0 || info.Process == windows.InvalidHandle {
+		return nil, errors.New("管理员核心未返回进程句柄")
+	}
+	pid, err := windows.GetProcessId(info.Process)
+	if err != nil {
+		_ = windows.CloseHandle(info.Process)
+		return nil, fmt.Errorf("读取管理员核心进程 ID：%w", err)
+	}
+	return &windowsCoreProcess{handle: info.Process, pid: int(pid)}, nil
+}
+
+func filepathDir(path string) string {
+	index := len(path) - 1
+	for index >= 0 && path[index] != '\\' && path[index] != '/' {
+		index--
+	}
+	if index <= 0 {
+		return "."
+	}
+	return path[:index]
+}
+
+func (p *namedPipeServer) close() {
+	if p.handle != 0 && p.handle != windows.InvalidHandle {
+		_ = windows.CloseHandle(p.handle)
+		p.handle = windows.InvalidHandle
+	}
+}
+
+func (p *windowsCoreProcess) Wait() error {
+	p.mu.Lock()
+	handle := p.handle
+	p.mu.Unlock()
+	event, err := windows.WaitForSingleObject(handle, windows.INFINITE)
+	p.release()
+	if err != nil {
+		return err
+	}
+	if event != windows.WAIT_OBJECT_0 {
+		return fmt.Errorf("等待管理员核心退出返回状态 0x%X", event)
+	}
+	return nil
+}
+
+func (p *windowsCoreProcess) Kill() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.handle == 0 || p.handle == windows.InvalidHandle {
+		return nil
+	}
+	err := windows.TerminateProcess(p.handle, 1)
+	if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		// The desktop UI runs unelevated and can never terminate an elevated
+		// core; pretending success let callers wait forever for a process that
+		// is still running.
+		return fmt.Errorf("终止管理员核心：%w", err)
+	}
+	return err
+}
+
+// waitTimeout waits for the process to exit up to timeout, then releases the
+// handle. It is used on launch-failure paths where the caller gives up on the
+// process; the session watcher keeps using the unbounded Wait instead.
+func (p *windowsCoreProcess) waitTimeout(timeout time.Duration) error {
+	p.mu.Lock()
+	handle := p.handle
+	p.mu.Unlock()
+	if handle == 0 || handle == windows.InvalidHandle {
+		return nil
+	}
+	event, err := windows.WaitForSingleObject(handle, uint32(timeout/time.Millisecond))
+	p.release()
+	if err != nil {
+		return err
+	}
+	switch event {
+	case windows.WAIT_OBJECT_0:
+		return nil
+	case uint32(windows.WAIT_TIMEOUT):
+		return fmt.Errorf("等待管理员核心退出超时（%v）", timeout)
+	default:
+		return fmt.Errorf("等待管理员核心退出返回状态 0x%X", event)
+	}
+}
+
+func (p *windowsCoreProcess) PID() int {
+	return p.pid
+}
+
+func (p *windowsCoreProcess) release() {
+	p.once.Do(func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if p.handle != 0 && p.handle != windows.InvalidHandle {
+			_ = windows.CloseHandle(p.handle)
+			p.handle = windows.InvalidHandle
+		}
+	})
+}

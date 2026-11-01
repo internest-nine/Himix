@@ -1,0 +1,294 @@
+package services
+
+import (
+	"errors"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func testTunService(t *testing.T, platform tunPlatformSnapshot) *TunService {
+	t.Helper()
+	t.Setenv("HIMIX_DATA_DIR", t.TempDir())
+	settings := NewSettingsService()
+	adapters := []AdapterView{
+		{
+			ID: "ethernet", Name: "以太网", Address: "192.168.10.20",
+			PrefixLength: 24, Gateway: "192.168.10.1", Operational: true, Selected: true,
+		},
+		{
+			ID: "wlan", Name: "WLAN", Address: "192.168.10.21",
+			PrefixLength: 24, Gateway: "192.168.10.1", Operational: true, Selected: true,
+		},
+	}
+	return &TunService{
+		settings:        settings,
+		listAdapters:    func() ([]AdapterView, error) { return adapters, nil },
+		inspectPlatform: func(bool) tunPlatformSnapshot { return platform },
+		resolveEngine:   func() (string, error) { return filepath.Join(t.TempDir(), "himix-engine.exe"), nil },
+		resolveSingBox:  func() (string, error) { return filepath.Join(t.TempDir(), "sing-box.exe"), nil },
+		now:             func() time.Time { return time.Date(2026, 7, 31, 11, 0, 0, 0, time.UTC) },
+	}
+}
+
+func TestTunPreflightBlocksBeforeNetworkTakeover(t *testing.T) {
+	service := testTunService(t, tunPlatformSnapshot{
+		WFPReady:            false,
+		WFPDetail:           "BFE unavailable",
+		DefaultRouteAliases: []string{"Clash"},
+	})
+	snapshot, err := service.Preflight([]string{"ethernet", "wlan"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Ready {
+		t.Fatal("preflight must block without the privilege broker and with a foreign TUN")
+	}
+	if snapshot.EffectiveStrictRoute {
+		t.Fatal("failed WFP probe must use a per-run compatibility decision")
+	}
+	for _, code := range []string{
+		"privilege_broker_unavailable", "foreign_tun", "wfp_compatibility", "shared_lan_gateway",
+	} {
+		if !hasTunIssue(snapshot, code) {
+			t.Fatalf("missing %s in %+v", code, snapshot.Issues)
+		}
+	}
+	if len(snapshot.SharedGatewayRisks) != 1 {
+		t.Fatalf("shared gateway risks = %+v", snapshot.SharedGatewayRisks)
+	}
+}
+
+func TestTunPreflightCanBecomeReadyWithIndependentCore(t *testing.T) {
+	service := testTunService(t, tunPlatformSnapshot{
+		PrivilegeBrokerAvailable: true,
+		WFPReady:                 true,
+		WFPDetail:                "FwpmEngineOpen0 succeeded",
+	})
+	snapshot, err := service.Preflight([]string{"ethernet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snapshot.Ready || !snapshot.EffectiveStrictRoute {
+		t.Fatalf("expected a ready strict-route preflight: %+v", snapshot)
+	}
+	if len(snapshot.Issues) != 0 {
+		t.Fatalf("unexpected issues: %+v", snapshot.Issues)
+	}
+}
+
+func TestTunPreflightIsReusedOnceForImmediateStartup(t *testing.T) {
+	service := testTunService(t, tunPlatformSnapshot{
+		PrivilegeBrokerAvailable: true,
+		WFPReady:                 true,
+	})
+	checkedAt := time.Date(2026, 7, 31, 11, 0, 0, 0, time.UTC)
+	service.now = func() time.Time { return checkedAt }
+	inspectionCalls := 0
+	service.inspectPlatform = func(bool) tunPlatformSnapshot {
+		inspectionCalls++
+		return tunPlatformSnapshot{PrivilegeBrokerAvailable: true, WFPReady: true}
+	}
+	if _, err := service.Preflight([]string{"ethernet"}); err != nil {
+		t.Fatal(err)
+	}
+	available, err := service.listAdapters()
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := []AdapterView{available[0]}
+	cached, reused := service.consumeRecentPreflight(selected)
+	if !reused || !cached.Ready {
+		t.Fatalf("immediate startup did not reuse ready preflight: reused=%t snapshot=%+v", reused, cached)
+	}
+	if inspectionCalls != 1 {
+		t.Fatalf("platform inspections = %d, want 1", inspectionCalls)
+	}
+	if _, reused = service.consumeRecentPreflight(selected); reused {
+		t.Fatal("startup preflight cache was reused more than once")
+	}
+}
+
+func TestTunPreflightReuseRejectsChangedOrExpiredNetwork(t *testing.T) {
+	service := testTunService(t, tunPlatformSnapshot{
+		PrivilegeBrokerAvailable: true,
+		WFPReady:                 true,
+	})
+	now := time.Date(2026, 7, 31, 11, 0, 0, 0, time.UTC)
+	service.now = func() time.Time { return now }
+	available, err := service.listAdapters()
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := []AdapterView{available[0]}
+	if _, err := service.Preflight([]string{"ethernet"}); err != nil {
+		t.Fatal(err)
+	}
+	changed := append([]AdapterView(nil), selected...)
+	changed[0].Address = "192.168.10.99"
+	if _, reused := service.consumeRecentPreflight(changed); reused {
+		t.Fatal("preflight was reused after the adapter address changed")
+	}
+	if _, err := service.Preflight([]string{"ethernet"}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(startupPreflightReuseWindow + time.Millisecond)
+	if _, reused := service.consumeRecentPreflight(selected); reused {
+		t.Fatal("expired preflight was reused for startup")
+	}
+}
+
+func TestTunPreflightTreatsSharedGatewayAsInformational(t *testing.T) {
+	service := testTunService(t, tunPlatformSnapshot{
+		PrivilegeBrokerAvailable: true,
+		WFPReady:                 true,
+	})
+	snapshot, err := service.Preflight([]string{"ethernet", "wlan"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snapshot.Ready {
+		t.Fatalf("shared LAN topology must not block TUN startup: %+v", snapshot)
+	}
+	for _, issue := range snapshot.Issues {
+		if issue.Code == "shared_lan_gateway" && issue.Level != "info" {
+			t.Fatalf("shared gateway issue = %+v; want informational", issue)
+		}
+	}
+}
+
+func TestTunPreflightElevatedHostIsInformationalWithoutConfirmation(t *testing.T) {
+	service := testTunService(t, tunPlatformSnapshot{
+		HostElevated:             true,
+		PrivilegeBrokerAvailable: true,
+		WFPReady:                 true,
+		WFPDetail:                "FwpmEngineOpen0 succeeded",
+	})
+	snapshot, err := service.Preflight([]string{"ethernet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snapshot.Ready {
+		t.Fatalf("elevated compatibility mode was blocked: %+v", snapshot)
+	}
+	for _, issue := range snapshot.Issues {
+		if issue.Code != "elevated_ui_host" {
+			t.Fatalf("unexpected elevated compatibility issue: %+v", issue)
+		}
+		if issue.Level != "info" {
+			t.Fatalf("supported elevated compatibility mode must not require startup confirmation, got %+v", issue)
+		}
+	}
+	if !hasTunIssue(snapshot, "elevated_ui_host") {
+		t.Fatalf("missing elevated compatibility diagnostic: %+v", snapshot.Issues)
+	}
+}
+
+func TestTunPreflightElevatedCompatibilityDoesNotMuteOtherRisks(t *testing.T) {
+	service := testTunService(t, tunPlatformSnapshot{
+		HostElevated: true, PrivilegeBrokerAvailable: true, WFPReady: true,
+		DefaultRouteAliases: []string{"Other VPN"},
+	})
+	snapshot, err := service.Preflight([]string{"ethernet"})
+	if err != nil || !snapshot.Ready {
+		t.Fatalf("unexpected preflight failure: %+v %v", snapshot, err)
+	}
+	for _, issue := range snapshot.Issues {
+		if issue.Code == "foreign_tun" {
+			if issue.Level != "warning" {
+				t.Fatalf("compatibility mode suppressed unrelated routing warning: %+v", issue)
+			}
+			return
+		}
+	}
+	t.Fatal("missing unrelated routing warning")
+}
+
+func TestTunPreflightElevatedHostStillRequiresCoreChannel(t *testing.T) {
+	service := testTunService(t, tunPlatformSnapshot{
+		HostElevated:             true,
+		PrivilegeBrokerAvailable: false,
+		WFPReady:                 true,
+	})
+	snapshot, err := service.Preflight([]string{"ethernet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Ready {
+		t.Fatalf("missing Core channel was ignored: %+v", snapshot)
+	}
+	if firstTunBlocker(snapshot) == nil {
+		t.Fatal("elevated compatibility must not bypass missing Core channel")
+	}
+	if !hasTunIssue(snapshot, "elevated_ui_host") || !hasTunIssue(snapshot, "privilege_broker_unavailable") {
+		t.Fatalf("unexpected elevated Core-channel evidence: %+v", snapshot.Issues)
+	}
+}
+
+func TestTunPreflightReportsMissingResources(t *testing.T) {
+	service := testTunService(t, tunPlatformSnapshot{
+		PrivilegeBrokerAvailable: true,
+		WFPReady:                 true,
+	})
+	service.resolveEngine = func() (string, error) { return "", errors.New("engine missing") }
+	service.resolveSingBox = func() (string, error) { return "", errors.New("sing-box missing") }
+	snapshot, err := service.Preflight([]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, code := range []string{"engine_missing", "sing_box_missing"} {
+		if !hasTunIssue(snapshot, code) {
+			t.Fatalf("missing %s in %+v", code, snapshot.Issues)
+		}
+	}
+}
+
+func TestTunPreflightReportsReadOnlyForeignNetworkRisks(t *testing.T) {
+	service := testTunService(t, tunPlatformSnapshot{
+		PrivilegeBrokerAvailable: true,
+		WFPReady:                 true,
+		NetworkRisks: []string{
+			"active foreign virtual adapter: vgate0",
+			"multiple IPv4 default routes: Ethernet metric=25, vgate0 metric=1",
+		},
+	})
+	snapshot, err := service.Preflight([]string{"ethernet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.NetworkRisks) != 2 || !hasTunIssue(snapshot, "foreign_network_risk") {
+		t.Fatalf("read-only network risk evidence missing: %+v", snapshot)
+	}
+	if snapshot.Ready == false {
+		t.Fatalf("network risks should warn without blocking: %+v", snapshot)
+	}
+}
+
+func TestTunPreflightAllowsCoreToRecoverOwnedStaleTun(t *testing.T) {
+	service := testTunService(t, tunPlatformSnapshot{
+		PrivilegeBrokerAvailable: true,
+		WFPReady:                 true,
+		DefaultRouteAliases:      []string{"Himix-Tun"},
+	})
+	snapshot, err := service.Preflight([]string{"ethernet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snapshot.Ready || !hasTunIssue(snapshot, "stale_himix_tun") {
+		t.Fatalf("owned stale TUN should be recoverable by Core: %+v", snapshot)
+	}
+	for _, issue := range snapshot.Issues {
+		if issue.Code == "stale_himix_tun" && issue.Level != "warning" {
+			t.Fatalf("owned stale TUN must warn without blocking: %+v", issue)
+		}
+	}
+}
+
+func hasTunIssue(snapshot TunPreflightSnapshot, code string) bool {
+	for _, issue := range snapshot.Issues {
+		if issue.Code == code {
+			return true
+		}
+	}
+	return false
+}

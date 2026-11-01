@@ -1,0 +1,331 @@
+import { PageActivity } from "../components/shell/PageActivity";
+// @vitest-environment jsdom
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { FluentProvider, webLightTheme } from "@fluentui/react-components";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { RoutingPage, reconcileSavedDrafts } from "./RoutingPage";
+
+const mocks = vi.hoisted(() => ({ snapshot: vi.fn(), save: vi.fn(), validate: vi.fn(), previewBatch: vi.fn(), notify: vi.fn(), probe: vi.fn(), translate: (key: string) => key }));
+vi.mock("../platform/services", () => ({ appServices: {
+  routing: { snapshot: mocks.snapshot, save: mocks.save, validate: mocks.validate, previewBatch: mocks.previewBatch },
+  routeProbe: { probe: mocks.probe },
+  engine: { snapshot: async () => ({ phase: "stopped", mode: "tun" }) },
+} }));
+vi.mock("../components/notifications/AppNotifications", () => ({ useAppNotifications: () => ({ notify: mocks.notify }) }));
+vi.mock("../i18n/i18n", () => ({ useI18n: () => ({ locale: "en", t: mocks.translate }) }));
+
+const outbounds = [{ id: "direct", label: "Direct" }, { id: "aggregation", label: "Aggregation" }, { id: "reject", label: "Reject connection" }];
+// Match App's portal and focus-management context rather than using the
+// fallback Tabster root, which can hide the dialog as preview controls change.
+const renderPage = () => render(<FluentProvider theme={webLightTheme}><RoutingPage /></FluentProvider>);
+
+// The editor opens on the domain tab now, so cases that exercise process rules
+// switch tabs once the page has mounted.
+async function showProcessRules() {
+  fireEvent.click(await screen.findByRole("tab", { name: /routing_tab_process/ }));
+  return screen.findByDisplayValue("browser.exe");
+}
+
+// Same, for cases that start from their own snapshot instead of browser.exe.
+async function renderProcessPage() {
+  const view = render(<FluentProvider theme={webLightTheme}><RoutingPage /></FluentProvider>);
+  fireEvent.click(await screen.findByRole("tab", { name: /routing_tab_process/ }));
+  return view;
+}
+beforeEach(() => {
+  vi.clearAllMocks();
+  vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
+  mocks.snapshot.mockResolvedValue({ rules: [
+    { match_type: "process", value: "old.exe", outbound: "nic_old", priority: 70 },
+    { match_type: "process", value: "browser.exe", outbound: "direct" },
+    { match_type: "domain", value: "example.com", outbound: "nic_old" },
+  ], outbounds, restart_required: false });
+  mocks.validate.mockImplementation(async (rule) => ({ valid: true, rule, duplicate: false }));
+  mocks.save.mockImplementation(async (rules) => ({ rules, outbounds, restart_required: false }));
+});
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
+
+it.each([
+  { isComposing: true, keyCode: 13 },
+  { isComposing: false, keyCode: 229 },
+])("keeps IME candidate confirmation separate from rule submission (%j)", async (compositionKey) => {
+  renderPage();
+  await showProcessRules();
+  const input = screen.getByRole("textbox", { name: "New rule match value" });
+  fireEvent.compositionStart(input);
+  fireEvent.change(input, { target: { value: "中文.exe" } });
+  fireEvent.keyDown(input, { key: "Enter", code: "Enter", ...compositionKey });
+  expect(mocks.validate).not.toHaveBeenCalled();
+  expect(input).toHaveProperty("value", "中文.exe");
+  expect(screen.queryByRole("switch", { name: "Enable rule 中文.exe" })).toBeNull();
+
+  fireEvent.compositionEnd(input, { data: "中文" });
+  fireEvent.keyDown(input, { key: "Enter", code: "Enter", isComposing: false, keyCode: 13 });
+  await screen.findByRole("switch", { name: "Enable rule 中文.exe" });
+  expect(mocks.validate).toHaveBeenCalledTimes(1);
+  expect(input).toHaveProperty("value", "");
+});
+
+it("reports a failed add validation and allows retry", async () => {
+  renderPage();
+  await showProcessRules();
+  const input = screen.getByRole("textbox", { name: "New rule match value" });
+  fireEvent.change(input, { target: { value: "new.exe" } });
+  mocks.validate.mockRejectedValueOnce(new Error("Service unavailable"));
+  fireEvent.keyDown(input, { key: "Enter" });
+  await waitFor(() => expect(mocks.notify).toHaveBeenCalledWith(expect.objectContaining({ title: "Unable to add rule" })));
+  expect(screen.queryByRole("switch", { name: "Enable rule new.exe" })).toBeNull();
+  fireEvent.keyDown(input, { key: "Enter" });
+  await screen.findByRole("switch", { name: "Enable rule new.exe" });
+});
+
+it("prevents duplicate submissions while add validation is pending", async () => {
+  renderPage();
+  await showProcessRules();
+  let resolveValidation!: (result: unknown) => void;
+  mocks.validate.mockImplementationOnce(() => new Promise(resolve => { resolveValidation = resolve; }));
+  const input = screen.getByRole("textbox", { name: "New rule match value" });
+  fireEvent.change(input, { target: { value: "new.exe" } });
+  fireEvent.keyDown(input, { key: "Enter" });
+  fireEvent.keyDown(input, { key: "Enter" });
+  expect(mocks.validate).toHaveBeenCalledTimes(1);
+  await act(async () => resolveValidation({ valid: true, rule: { match_type: "process", value: "new.exe", outbound: "direct" }, duplicate: false }));
+  expect(screen.getAllByRole("switch", { name: "Enable rule new.exe" })).toHaveLength(1);
+});
+
+it("saves reject and restores the rule without marking its egress unavailable", async () => {
+  let saved = [{ match_type: "process", value: "app.exe", outbound: "direct" }];
+  mocks.snapshot.mockImplementation(async () => ({ rules: saved, outbounds, restart_required: false }));
+  mocks.save.mockImplementation(async (rules) => {
+    saved = rules;
+    return { rules, outbounds, restart_required: false };
+  });
+  const view = await renderProcessPage();
+  const input = await screen.findByDisplayValue("app.exe");
+  const row = within(input.closest('[role="row"]') as HTMLElement);
+  fireEvent.click(row.getByRole("combobox"));
+  fireEvent.click(screen.getByRole("option", { name: "routing_outbound_reject" }));
+  await waitFor(() => expect(mocks.save).toHaveBeenCalledWith(
+    [expect.objectContaining({ outbound: "reject" })], expect.any(Array),
+  ), { timeout: 4000 });
+  view.unmount();
+  await renderProcessPage();
+  await screen.findByDisplayValue("app.exe");
+  expect(screen.queryByText(/Outbound reject is disabled or unavailable/)).toBeNull();
+  expect(screen.getByRole("switch", { name: "Enable rule app.exe" })).toHaveProperty("checked", true);
+});
+
+it("offers reject in browser preview for new, existing, and batch rules", async () => {
+  mocks.snapshot.mockRejectedValueOnce(new Error("Browser preview has no desktop bridge"));
+  await renderProcessPage();
+  const input = await screen.findByDisplayValue("application-01.exe");
+  const newEgress = screen.getByRole("combobox", { name: "New rule egress" });
+  fireEvent.click(newEgress);
+  fireEvent.click(screen.getByRole("option", { name: "routing_outbound_reject" }));
+  expect(newEgress.textContent).toContain("routing_outbound_reject");
+
+  const row = within(input.closest('[role="row"]') as HTMLElement);
+  const rowEgress = row.getByRole("combobox");
+  fireEvent.click(rowEgress);
+  expect(screen.getByRole("option", { name: "routing_outbound_reject" })).toBeTruthy();
+  fireEvent.keyDown(rowEgress, { key: "Escape" });
+
+  fireEvent.click(screen.getByRole("button", { name: /Batch add/ }));
+  // Fluent keeps the dialog surface aria-hidden while it animates in, so
+  // scoping the query to that subtree raced the transition. Wait for the control
+  // itself instead.
+  const batchEgress = await screen.findByRole("combobox", { name: "Egress policy" });
+  expect(batchEgress.textContent).toContain("routing_outbound_reject");
+  fireEvent.click(batchEgress);
+  expect(screen.getByRole("option", { name: "routing_outbound_reject" })).toBeTruthy();
+});
+
+it("preserves row identity when the backend normalizes priority and casing", () => {
+  const submitted = [{ id: "selected-rule", match_type: "process", value: "App.exe", outbound: "direct", priority: 70, disabled: true }];
+  const saved = reconcileSavedDrafts([{ match_type: "process", value: "app.exe", outbound: "direct", priority: 2, disabled: true }], submitted);
+  expect(saved[0]).toMatchObject({ id: "selected-rule", priority: 2, disabled: true });
+  expect(saved.filter((rule) => !new Set(["selected-rule"]).has(rule.id))).toEqual([]);
+});
+
+it("keeps selected rows deletable after normalized settings are saved", async () => {
+  mocks.snapshot.mockResolvedValue({ rules: [{ match_type: "process", value: "app.exe", outbound: "direct", priority: 70 }], outbounds, restart_required: false });
+  mocks.save.mockImplementation(async (rules) => ({ rules: rules.map((rule: any) => ({ ...rule, priority: 2 })), outbounds, restart_required: false }));
+  await renderProcessPage();
+  fireEvent.click(await screen.findByRole("switch", { name: "Enable rule app.exe" }));
+  const selection = screen.getByRole("checkbox", { name: "Select app.exe" }) as HTMLInputElement;
+  if (!selection.checked) fireEvent.click(selection);
+  await waitFor(() => expect(mocks.save).toHaveBeenCalled(), { timeout: 4000 });
+  await waitFor(() => expect(screen.getByRole("checkbox", { name: "Select app.exe" })).toHaveProperty("checked", true));
+  fireEvent.click(screen.getByRole("button", { name: /Delete selected/ }));
+  fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+  await waitFor(() => expect(mocks.save).toHaveBeenLastCalledWith([], expect.any(Array)), { timeout: 4000 });
+});
+
+it("disables unavailable rules across tabs and persists priority without deleting rules", async () => {
+  await renderProcessPage();
+  await screen.findByRole("switch", { name: "Enable rule old.exe" });
+  fireEvent.click(screen.getByRole("button", { name: "Disable unavailable rules" }));
+  await waitFor(() => expect(mocks.save).toHaveBeenCalled(), { timeout: 4000 });
+  const saved = mocks.save.mock.calls[mocks.save.mock.calls.length - 1][0];
+  expect(saved).toHaveLength(3);
+  expect(saved[0]).toMatchObject({ disabled: true, priority: 70, outbound: "nic_old" });
+  expect(saved[1].disabled).toBeUndefined();
+  expect(saved[2].disabled).toBe(true);
+  expect((screen.getByRole("switch", { name: "Enable rule old.exe" }) as HTMLInputElement).checked).toBe(false);
+  expect(screen.queryByRole("spinbutton")).toBeNull();
+  fireEvent.click(screen.getByRole("combobox", { name: "Match order" }));
+  expect(screen.getAllByRole("option")).toHaveLength(6);
+  fireEvent.click(screen.getByRole("option", { name: "IP → Domain → Process" }));
+  await waitFor(() => expect(mocks.save).toHaveBeenLastCalledWith(expect.any(Array), ["ip", "domain", "process"]), { timeout: 4000 });
+});
+
+it("keeps rules unchanged when refreshing adapter availability fails", async () => {
+  await renderProcessPage();
+  await screen.findByRole("switch", { name: "Enable rule old.exe" });
+  mocks.snapshot.mockRejectedValueOnce(new Error("Adapter enumeration failed"));
+  fireEvent.click(screen.getByRole("button", { name: "Disable unavailable rules" }));
+  await waitFor(() => expect(mocks.notify).toHaveBeenCalledWith(expect.objectContaining({ title: "Egress check failed" })));
+  expect(mocks.save).not.toHaveBeenCalled();
+  expect((screen.getByRole("switch", { name: "Enable rule old.exe" }) as HTMLInputElement).checked).toBe(true);
+});
+
+
+it("saves type order with an empty rule list", async () => {
+  mocks.snapshot.mockResolvedValue({ rules: [], outbounds, restart_required: false, match_order: ["domain", "ip", "process"] });
+  renderPage();
+  const order = await screen.findByRole("combobox", { name: "Match order" });
+  await waitFor(() => expect(order.textContent).toContain("Domain → IP → Process"));
+  fireEvent.click(order);
+  fireEvent.click(screen.getByRole("option", { name: "IP → Process → Domain" }));
+  await waitFor(() => expect(mocks.save).toHaveBeenLastCalledWith([], ["ip", "process", "domain"]), { timeout: 4000 });
+});
+
+it.each([{ rules: [] }, { rules: [{ match_type: "process", value: "app.exe", outbound: "direct" }] }])("persists match order when leaving immediately after selection (%j)", async ({ rules }) => {
+  let saved = { rules, outbounds, restart_required: false, match_order: ["process", "domain", "ip"] };
+  mocks.snapshot.mockImplementation(async () => saved);
+  let finishSave!: () => void;
+  mocks.save.mockImplementation((nextRules, order) => new Promise(resolve => {
+    finishSave = () => { saved = { ...saved, rules: nextRules, match_order: order }; resolve(saved); };
+  }));
+  const view = renderPage();
+  const order = await screen.findByRole("combobox", { name: "Match order" });
+  await waitFor(() => expect(order).toHaveProperty("disabled", false));
+  fireEvent.click(order);
+  fireEvent.click(screen.getByRole("option", { name: "IP → Domain → Process" }));
+  expect(mocks.save).toHaveBeenCalledWith(expect.any(Array), ["ip", "domain", "process"]);
+  view.unmount();
+  finishSave();
+  renderPage();
+  await waitFor(() => expect(screen.getByRole("combobox", { name: "Match order" }).textContent).toContain("IP → Domain → Process"));
+  expect(mocks.save).toHaveBeenCalledTimes(1);
+});
+
+it("keeps a disabled conflict disabled when a batch replaces its egress", async () => {
+  mocks.snapshot.mockResolvedValue({ rules: [{ match_type: "process", value: "app.exe", outbound: "direct", disabled: true, priority: 2 }], outbounds, restart_required: false });
+  // Even an older or stale preview missing the state must not re-enable it.
+  let finishPreview!: () => void;
+  mocks.previewBatch.mockImplementation(() => new Promise(resolve => {
+    finishPreview = () => resolve({ add_count: 0, duplicate_count: 0, conflict_count: 1, invalid_count: 0, items: [{ status: "conflict", input: "app.exe", existing_outbound: "direct", rule: { match_type: "process", value: "app.exe", outbound: "aggregation" } }] });
+  }));
+  await renderProcessPage();
+  await screen.findByRole("switch", { name: "Enable rule app.exe" });
+  fireEvent.click(screen.getByRole("button", { name: /Batch add/ }));
+  const surface = await screen.findByRole("dialog");
+  const dialog = within(surface);
+  await waitFor(() => expect(surface.contains(document.activeElement)).toBe(true));
+  fireEvent.change(await dialog.findByPlaceholderText(/browser\.exe/), { target: { value: "app.exe" } });
+  const previewButton = dialog.getByRole("button", { name: "Preview 1" });
+  // fireEvent.click does not perform the focus step of an actual mouse or
+  // keyboard interaction. Exercise focus across the asynchronous update.
+  act(() => previewButton.focus());
+  fireEvent.click(previewButton);
+  expect(previewButton.getAttribute("aria-disabled")).toBe("true");
+  expect(document.activeElement).toBe(previewButton);
+  fireEvent.click(previewButton);
+  expect(mocks.previewBatch).toHaveBeenCalledTimes(1);
+  await act(async () => { finishPreview(); });
+  const blockedAdd = dialog.getByRole("button", { name: "Add 0 rules" });
+  expect(blockedAdd).toBe(previewButton);
+  expect(blockedAdd.getAttribute("aria-disabled")).toBe("true");
+  expect(document.activeElement).toBe(blockedAdd);
+  fireEvent.click(blockedAdd);
+  expect(mocks.save).not.toHaveBeenCalled();
+  const replaceConflict = await dialog.findByRole("checkbox", { name: "Update conflicting rules to the selected egress" });
+  act(() => replaceConflict.focus());
+  fireEvent.click(replaceConflict);
+  await waitFor(() => expect(replaceConflict).toHaveProperty("checked", true));
+  const addRules = await waitFor(() => {
+    expect(surface.getAttribute("aria-hidden")).not.toBe("true");
+    expect(surface.contains(document.activeElement)).toBe(true);
+    const button = dialog.getByRole("button", { name: "Add 1 rules" });
+    expect(button.getAttribute("aria-disabled")).not.toBe("true");
+    expect(button).toHaveProperty("disabled", false);
+    return button;
+  }, { timeout: 4000 });
+  fireEvent.click(addRules);
+  await waitFor(() => expect(mocks.save).toHaveBeenCalledWith([expect.objectContaining({ value: "app.exe", outbound: "aggregation", disabled: true, priority: 2 })], expect.any(Array)));
+  await waitFor(() => expect(screen.getByRole("switch", { name: "Enable rule app.exe" })).toHaveProperty("checked", false));
+});
+
+
+it("refreshes cached rules on return without clearing filters, selection, or the add draft", async () => {
+  const page = (active: boolean) => <FluentProvider theme={webLightTheme}><PageActivity.Provider value={active}><RoutingPage /></PageActivity.Provider></FluentProvider>;
+  const view = render(page(true));
+  const rule = await showProcessRules();
+  fireEvent.click(screen.getByRole("checkbox", { name: "Select browser.exe" }));
+  fireEvent.change(screen.getByRole("searchbox", { name: "Filter current rules" }), { target: { value: "browser" } });
+  fireEvent.change(screen.getByRole("textbox", { name: "New rule match value" }), { target: { value: "draft.exe" } });
+  view.rerender(page(false));
+  mocks.snapshot.mockResolvedValueOnce({ rules: [{ match_type: "process", value: "browser.exe", outbound: "aggregation" }], outbounds, restart_required: false });
+  view.rerender(page(true));
+  await waitFor(() => expect(screen.getByRole("combobox", { name: "Egress: browser.exe" }).textContent).toBe("routing_outbound_aggregation"));
+  expect(screen.getByDisplayValue("browser.exe")).toBe(rule);
+  expect(screen.getByRole("checkbox", { name: "Select browser.exe" })).toHaveProperty("checked", true);
+  expect(screen.getByRole("searchbox", { name: "Filter current rules" })).toHaveProperty("value", "browser");
+  expect(screen.getByRole("textbox", { name: "New rule match value" })).toHaveProperty("value", "draft.exe");
+});
+
+it("re-points a new rule at the only adapter that can reach the target", async () => {
+  mocks.snapshot.mockResolvedValue({
+    rules: [],
+    outbounds: [
+      { id: "aggregation", label: "Aggregation" },
+      { id: "nic_eth", label: "Ethernet" },
+      { id: "nic_wifi", label: "Wi-Fi" },
+    ],
+    restart_required: false,
+  });
+  mocks.probe.mockResolvedValue({
+    value: "intranet.example.com",
+    host: "intranet.example.com",
+    addresses: ["10.20.30.40"],
+    ports: [443, 80],
+    hops: [
+      { adapter_id: "eth", adapter_name: "Ethernet", kind: "ethernet", source_address: "10.0.0.5", target: "10.20.30.40:443", ok: true, latency_ms: 12 },
+      { adapter_id: "wifi", adapter_name: "Wi-Fi", kind: "wifi", source_address: "192.168.1.9", target: "10.20.30.40:443", ok: false, latency_ms: 0 },
+    ],
+    recommended_adapter_id: "eth",
+    recommended_name: "Ethernet",
+    all_failed: false,
+  });
+
+  render(<FluentProvider theme={webLightTheme}><RoutingPage /></FluentProvider>);
+
+  const egress = await screen.findByRole("combobox", { name: "New rule egress" });
+  fireEvent.click(egress);
+  fireEvent.click(screen.getByRole("option", { name: "Wi-Fi" }));
+
+  fireEvent.change(await screen.findByRole("textbox", { name: "New rule match value" }), {
+    target: { value: "intranet.example.com" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "routing_add" }));
+
+  await waitFor(() => {
+    const calls = mocks.save.mock.calls;
+    const lastRules = calls.length > 0 ? (calls[calls.length - 1][0] as Array<{ value: string; outbound: string }>) : [];
+    expect(lastRules).toEqual(expect.arrayContaining([
+      expect.objectContaining({ value: "intranet.example.com", outbound: "nic_eth" }),
+    ]));
+  });
+  expect(mocks.probe).toHaveBeenCalledWith("intranet.example.com");
+});

@@ -1,0 +1,239 @@
+package services
+
+import (
+	"fmt"
+	"net"
+	"sort"
+	"strings"
+)
+
+type AdapterView struct {
+	ID             string   `json:"id"`
+	Name           string   `json:"name"`
+	Description    string   `json:"description"`
+	Address        string   `json:"address"`
+	PrefixLength   int      `json:"prefix_length"`
+	SourceIPv6     string   `json:"source_ipv6,omitempty"`
+	IfIndex        int      `json:"if_index"`
+	IPv6IfIndex    int      `json:"ipv6_if_index,omitempty"`
+	Gateway        string   `json:"gateway,omitempty"`
+	IPv6Gateway    string   `json:"ipv6_gateway,omitempty"`
+	IPv6Metric     int      `json:"ipv6_metric,omitempty"`
+	IPv6AutoMetric bool     `json:"ipv6_automatic_metric,omitempty"`
+	DNSServers     []string `json:"dns_servers"`
+	Metric         int      `json:"metric"`
+	AutoMetric     bool     `json:"automatic_metric"`
+	Selected       bool     `json:"selected"`
+	Weight         int      `json:"weight"`
+	Kind           string   `json:"kind"`
+	Operational    bool     `json:"operational"`
+	IsVirtual      bool     `json:"is_virtual,omitempty"`
+}
+
+type AdapterService struct {
+	settings             *SettingsService
+	saveRuntimeSelection func(string, bool, []AdapterView) ([]AdapterView, error)
+	// list is overridden by tests that need a fixed adapter set. Link failover
+	// deliberately reads the OS through this service rather than the engine's
+	// runtime snapshot, because it answers "what does Windows still see?".
+	list func() ([]AdapterView, error)
+}
+
+func NewAdapterService(settings *SettingsService) *AdapterService {
+	return &AdapterService{settings: settings}
+}
+
+func (s *AdapterService) List() ([]AdapterView, error) {
+	if s.list != nil {
+		return s.list()
+	}
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil, fmt.Errorf("扫描网络适配器失败：%w", err)
+	}
+	settings := s.settings.Get()
+	metadata := adapterPlatformMetadata()
+	selected := make(map[string]struct{}, len(settings.SelectedAdapterIDs))
+	for _, id := range settings.SelectedAdapterIDs {
+		selected[id] = struct{}{}
+	}
+	result := make([]AdapterView, 0, len(interfaces))
+	for _, item := range interfaces {
+		if item.Flags&net.FlagUp == 0 || item.Flags&net.FlagLoopback != 0 || isHimixManagedAdapter(item.Name) {
+			continue
+		}
+		addresses, addressErr := item.Addrs()
+		if addressErr != nil {
+			continue
+		}
+		var ipv4, ipv6 string
+		prefixLength := 0
+		for _, address := range addresses {
+			ip, network, parseErr := net.ParseCIDR(address.String())
+			if parseErr != nil || ip.IsLoopback() || ip.IsUnspecified() {
+				continue
+			}
+			if value := ip.To4(); value != nil {
+				if value[0] == 169 && value[1] == 254 {
+					continue
+				}
+				if ipv4 == "" {
+					ipv4 = value.String()
+					if ones, bits := network.Mask.Size(); bits == 32 {
+						prefixLength = ones
+					}
+				}
+			} else if !ip.IsLinkLocalUnicast() && !ip.IsMulticast() && !ip.IsPrivate() && ipv6 == "" {
+				// Without platform metadata there is no IPv6 gateway to prove that
+				// a unique local address (fc00::/7) reaches the Internet.
+				ipv6 = ip.String()
+			}
+		}
+		id := item.Name
+		_, isSelected := selected[id]
+		weight := settings.AdapterWeights[id]
+		if weight < AdapterWeightMin || weight > AdapterWeightMax {
+			weight = AdapterWeightDefault
+		}
+		kind := "ethernet"
+		lowerName := strings.ToLower(item.Name)
+		if strings.Contains(lowerName, "wi-fi") || strings.Contains(lowerName, "wifi") ||
+			strings.Contains(lowerName, "wlan") || strings.Contains(item.Name, "无线") {
+			kind = "wifi"
+		}
+		description := item.HardwareAddr.String()
+		if description == "" {
+			description = "Windows 网络接口"
+		}
+		details, hasDetails := metadata[item.Index]
+		if !hasDetails {
+			details = adapterMetadata{Metric: -1, AutoMetric: true, IPv6Metric: -1, IPv6AutoMetric: true, IPv6IfIndex: item.Index, PreferredIPv6: ipv6}
+		}
+		ipv6 = details.PreferredIPv6
+		if ipv4 == "" && ipv6 == "" {
+			continue
+		}
+		if details.Description != "" {
+			description = details.Description
+		}
+		result = append(result, AdapterView{
+			ID:             id,
+			Name:           item.Name,
+			Description:    description,
+			Address:        ipv4,
+			PrefixLength:   prefixLength,
+			SourceIPv6:     ipv6,
+			IfIndex:        item.Index,
+			IPv6IfIndex:    details.IPv6IfIndex,
+			Gateway:        details.Gateway,
+			IPv6Gateway:    details.IPv6Gateway,
+			IPv6Metric:     details.IPv6Metric,
+			IPv6AutoMetric: details.IPv6AutoMetric,
+			DNSServers:     details.DNSServers,
+			Metric:         details.Metric,
+			AutoMetric:     details.AutoMetric,
+			Selected:       isSelected,
+			Weight:         weight,
+			Kind:           kind,
+			Operational:    true,
+			IsVirtual:      details.IsTunnel || isVirtualAdapter(item.Name, description),
+		})
+	}
+	sort.SliceStable(result, func(i, j int) bool {
+		if result[i].Kind != result[j].Kind {
+			return result[i].Kind < result[j].Kind
+		}
+		return strings.ToLower(result[i].Name) < strings.ToLower(result[j].Name)
+	})
+	return result, nil
+}
+
+func isHimixManagedAdapter(name string) bool {
+	return strings.EqualFold(strings.TrimSpace(name), "Himix-Tun")
+}
+
+// Use driver descriptions as well as aliases: Windows users can rename a
+// VMware/Hyper-V interface to an ordinary Ethernet name. This is a display
+// classification, never a reason to remove an interface from the engine.
+func isVirtualAdapter(name, description string) bool {
+	value := strings.ToLower(name + " " + description)
+	for _, marker := range []string{
+		"vmware", "vmnet", "hyper-v", "hyperv", "vethernet", "virtualbox", "vbox",
+		"virtual ethernet", "virtual adapter", "virtual network", "virtual nic",
+		"wintun", "wireguard", "tailscale", "zerotier", "tap-windows", "tap-win32",
+		"meta tunnel", "mihomo", "clash", "radmin vpn", "famatech radmin",
+		"vpn client adapter", "docker", "wsl", "loopback adapter", "虚拟",
+		"teredo", "isatap", "6to4",
+	} {
+		if strings.Contains(value, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// Validate before starting either mode; the core still enforces this invariant.
+func validateAdapterSources(adapters []AdapterView) error {
+	seen := make(map[string]AdapterView)
+	for _, adapter := range adapters {
+		for _, address := range []string{adapter.Address, adapter.SourceIPv6} {
+			ip := net.ParseIP(strings.TrimSpace(address))
+			if ip == nil {
+				continue
+			}
+			key := ip.String()
+			if previous, exists := seen[key]; exists {
+				return fmt.Errorf("%s（接口 %d）与 %s（接口 %d）使用相同的源 IP %s，无法同时参与聚合。请先只选择其中一张网卡；若 Windows 显示的地址不同，请重新扫描网卡并导出支持日志", previous.Name, previous.IfIndex, adapter.Name, adapter.IfIndex, key)
+			}
+			seen[key] = adapter
+		}
+	}
+	return nil
+}
+
+func (s *AdapterService) Refresh() ([]AdapterView, error) {
+	return s.List()
+}
+
+func (s *AdapterService) SaveSelection(mode string, weighted bool, adapters []AdapterView) ([]AdapterView, error) {
+	if s.saveRuntimeSelection != nil {
+		return s.saveRuntimeSelection(mode, weighted, adapters)
+	}
+	return s.saveSelection(mode, weighted, adapters)
+}
+
+func (s *AdapterService) saveSelection(mode string, weighted bool, adapters []AdapterView) ([]AdapterView, error) {
+	if err := s.persistSelection(mode, weighted, adapters); err != nil {
+		return nil, err
+	}
+	return s.List()
+}
+
+func (s *AdapterService) persistSelection(mode string, weighted bool, adapters []AdapterView) error {
+	return s.persistSelectionStrategy(mode, weighted, adapters, "")
+}
+
+func (s *AdapterService) saveSelectionStrategy(mode string, weighted bool, adapters []AdapterView, strategy string) ([]AdapterView, error) {
+	if err := s.persistSelectionStrategy(mode, weighted, adapters, strategy); err != nil {
+		return nil, err
+	}
+	return s.List()
+}
+
+func (s *AdapterService) persistSelectionStrategy(mode string, weighted bool, adapters []AdapterView, strategy string) error {
+	selected := make([]string, 0, len(adapters))
+	weights := make(map[string]int, len(adapters))
+	for _, adapter := range adapters {
+		if adapter.Weight < AdapterWeightMin || adapter.Weight > AdapterWeightMax {
+			return fmt.Errorf("%s 的调度权重必须在 %d–%d 之间", adapter.Name, AdapterWeightMin, AdapterWeightMax)
+		}
+		weights[adapter.ID] = adapter.Weight
+		if adapter.Selected {
+			selected = append(selected, adapter.ID)
+		}
+	}
+	if _, err := s.settings.updateHomeStrategy(mode, weighted, selected, weights, strategy); err != nil {
+		return err
+	}
+	return nil
+}

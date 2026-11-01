@@ -1,0 +1,169 @@
+# Himix Go Engine
+
+This directory is the migration boundary between the desktop UI and the
+network engine. The executable provides a versioned IPC contract, owns the
+production source-bound ICMP diagnostic, the default SOCKS5/HTTP proxy with
+source-bound DNS/DoH, the TUN multi-port TCP/UDP pool, and managed
+sing-box/TUN/WFP/route lifecycle.
+
+See [MIGRATION.md](MIGRATION.md) for the staged migration plan and the mapping
+from current Qt signals to transport-independent engine events.
+
+## Build and test
+
+```powershell
+cd engine
+go mod download
+go test ./...
+go vet ./...
+go build -trimpath -o ..\dist\himix-engine.exe .\cmd\himix-engine
+```
+
+The only non-standard dependency is the version-pinned
+`golang.org/x/sys/windows` package. It is used for Windows process identity
+and IP Helper API access.
+
+Run the production-compatible one-shot diagnostic:
+
+```powershell
+.\dist\himix-engine.exe diagnose --src-ip 192.168.1.100 --target-ip 223.5.5.5
+```
+
+The command emits one JSON object with the same status, loss, latency, jitter,
+and counter fields consumed by the desktop UI.
+
+## Protocol v1
+
+The `serve` command reads newline-delimited JSON requests from standard input
+and writes newline-delimited JSON responses and events to standard output.
+Standard output is reserved for protocol messages; diagnostics belong on
+standard error.
+
+The language-neutral method manifest and canonical wire examples live in
+[`protocol/v1`](../protocol/v1/README.md). Go contract tests and the C# real
+process smoke client validate the same contract.
+
+Request:
+
+```json
+{"protocol":1,"id":"hello-1","method":"engine.hello","params":{}}
+```
+
+Success response:
+
+```json
+{"protocol":1,"id":"hello-1","result":{"protocol_version":1}}
+```
+
+Error response:
+
+```json
+{"protocol":1,"id":"bad-1","error":{"code":"method_not_found","message":"unknown method"}}
+```
+
+Event:
+
+```json
+{"protocol":1,"sequence":1,"event":"host.exiting","data":{"reason":"requested"}}
+```
+
+Protocol-v1 methods:
+
+- `engine.hello`: negotiate the protocol and inspect capabilities.
+- `engine.status`: read the canonical engine lifecycle state.
+- `engine.start`: start either the ordinary SOCKS5/HTTP TCP proxy or the
+  named-channel TUN TCP/UDP pool with explicit adapters, at least one usable IPv4 or IPv6 source,
+  independent interface indices, ports, and scheduling weights.
+- `engine.stop`: close listeners and cancel all accepted and relayed
+  connections with a bounded shutdown.
+- `engine.telemetry`: read cumulative per-adapter bytes, active connection
+  counts, optional connection details, DNS counters, adaptive health state,
+  and ordinary-proxy domain quarantines.
+- `tun.activate`: validate and start sing-box under Go-owned process and
+  network-resource containment after a TUN pool has returned its endpoints.
+- `tun.status`: inspect the managed sidecar state, PID, timestamps, exit code,
+  and last error.
+- `tun.deactivate`: stop the exact sidecar process tree and clean only the
+  Himix TUN routes and adapter while leaving the prepared pool available for
+  the enclosing transaction.
+- `dns.resolve`: resolve an A or AAAA record through a running engine and a
+  selected adapter for diagnostics. With no record type, IPv6-only adapters
+  prefer AAAA and fall back to A for connection-layer NAT64 synthesis.
+- `dns.status`: inspect DNS policy, upstreams, cache, in-flight work, and
+  counters without starting a query.
+- `health.check`: verify that the engine process and protocol loop respond.
+- `diagnostic.run`: run the same source-bound ICMP diagnostic exposed by the
+  one-shot `diagnose` command.
+- `host.shutdown`: acknowledge and gracefully stop the engine host process.
+
+Reserved lifecycle states are `stopped`, `starting`, `running`, `degraded`,
+`stopping`, and `failed`. `engine.hello.modes` advertises `proxy` and
+`tun_tcp_pool`. `engine.hello.mode_features` reports the exact transports
+available in each mode. The TUN pool owns literal-IPv4 SOCKS CONNECT and
+literal-IPv6 SOCKS CONNECT plus source-validated dual-stack UDP ASSOCIATE.
+Go owns the sing-box process and its TUN/WFP/route lifetime by default;
+sing-box still implements DNS, FakeIP, Wintun, and strict routing.
+
+Ordinary proxy domain targets are resolved by the Go engine before the
+adapter-bound TCP dial. A and AAAA queries run concurrently for the adapter's usable families.
+Multiple addresses are attempted with a 250 ms stagger and at most two sockets;
+an unresolved family retains a slot so same-family blackholes cannot starve it.
+`auto` races DoH endpoints and falls back to source-bound traditional DNS.
+On IPv6-only links it first uses adapter DNS to preserve DNS64; explicit
+providers retain strict encrypted query semantics. No ordinary proxy DNS path
+uses the Windows system resolver. TUN DNS remains owned by sing-box.
+
+`dot` is an explicit encrypted-only DNS policy. Set `dns.dot_servers` to
+1–16 `tls://hostname[:port]` URLs (IPv4 and bracketed IPv6 literals are also
+accepted; the default port is 853). TLS certificates and server names are
+verified. Connections are reused and isolated by adapter/source binding and
+endpoint, with at most two active queries per pool. A failed DoT query never
+falls back to plaintext or requests a compatibility restart. Server hostnames
+are bootstrapped through source-bound traditional DNS; application domain
+queries remain encrypted. NAT64 prefix discovery still uses network DNS.
+`dns.status` exposes `dot_endpoints`,
+`dot_successes`, and `dot_failures`. The desktop passes the same endpoint list
+to sing-box's TLS DNS upstream pool in TUN mode.
+
+IPv4 and IPv6 local faults have independent cooldowns and telemetry.
+NAT64 prefix discovery uses only the selected network DNS and RFC 7050;
+RFC 6052 synthesis supports IPv4 literal TCP/UDP and IPv4-only domains.
+A missing advertised prefix fails explicitly; no unbound IPv4 socket is used.
+See [the IPv6 acceptance plan](../docs/ipv6-adaptation-plan.md) for
+local verification, the opt-in public network runner, and unaccepted real-network items.
+
+Adapter-local transport failures use a shared bounded backoff across ordinary
+proxy and every TUN channel. Expired cooldowns become recovery candidates and
+a successful connection restores the adapter immediately. Ordinary proxy
+domain isolation requires repeated comparative evidence: one adapter fails
+while another succeeds for the same domain. All-adapter failures are never
+learned as a domain quarantine, and TUN literal-IP traffic never manufactures
+domain state.
+
+## Compatibility policy
+
+- Every request and message declares `protocol`.
+- Existing protocol-v1 fields keep their meaning for the lifetime of v1.
+- New optional response fields may be added without increasing the version.
+- Breaking field or lifecycle changes require a new protocol version.
+- UI clients must use `engine.hello` capabilities instead of assuming that a
+  newly introduced method exists.
+
+## Production boundary
+
+The Wails desktop client sends commands and renders events. Go exclusively owns proxy
+listeners, source-bound DNS, connection scheduling, telemetry, sing-box
+containment, and TUN cleanup. There is no alternate Python network backend.
+
+Installed builds discover the signed engine at
+`<runtime>\bin\himix-engine.exe`. Source builds stage the engine through the
+desktop Wails task:
+
+```powershell
+cd desktop
+wails3 task windows:build
+```
+
+The historical migration decisions remain under `docs/architecture`; the
+current production layout is summarized in
+[`frontend/README.md`](../frontend/README.md).

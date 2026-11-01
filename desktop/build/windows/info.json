@@ -1,0 +1,26 @@
+{
+	"fixed": {
+		"file_version": "0.1.0.65535",
+		"product_version": "0.1.0.65535"
+	},
+	"info": {
+		"0000": {
+			"FileVersion": "0.1",
+			"ProductVersion": "0.1",
+			"CompanyName": "Himix",
+			"FileDescription": "Himix",
+			"LegalCopyright": "Copyright 2026 Himix contributors",
+			"ProductName": "Himix",
+			"Comments": "Himix Wails v3 desktop client"
+		},
+		"0409": {
+			"FileVersion": "0.1",
+			"ProductVersion": "0.1",
+			"CompanyName": "Himix",
+			"FileDescription": "Himix",
+			"LegalCopyright": "Copyright 2026 Himix contributors",
+			"ProductName": "Himix",
+			"Comments": "Himix Wails v3 desktop client"
+		}
+	}
+}

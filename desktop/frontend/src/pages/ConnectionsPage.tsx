@@ -1,0 +1,917 @@
+import {
+  Badge,
+  Button,
+  Dialog,
+  DialogActions,
+  DialogBody,
+  DialogContent,
+  DialogSurface,
+  DialogTitle,
+  Dropdown,
+  Menu,
+  MenuGroup,
+  MenuGroupHeader,
+  MenuItem,
+  MenuList,
+  MenuPopover,
+  MessageBar,
+  MessageBarBody,
+  Option,
+  SearchBox,
+  Spinner,
+  Switch,
+  useRestoreFocusTarget,
+} from "@fluentui/react-components";
+import {
+  AppsListDetail24Regular,
+  ChevronRight16Regular,
+  Add20Regular,
+  ArrowDownload20Regular,
+  ArrowSync20Regular,
+  ArrowUpload20Regular,
+  Dismiss16Regular,
+  Filter20Regular,
+  Globe20Regular,
+  PlugConnected20Regular,
+} from "@fluentui/react-icons";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { GlassSurface } from "../components/material/GlassSurface";
+import { VirtualRows, type VirtualRow } from "../components/VirtualRows";
+import { usePageActive } from "../components/shell/PageActivity";
+import { PageHeader } from "../components/shell/PageHeader";
+import { useAppNotifications } from "../components/notifications/AppNotifications";
+import { useI18n } from "../i18n/i18n";
+import {
+  appServices,
+  type ConnectionListSnapshot,
+  type ConnectionView,
+  type RoutingBatchPreview,
+  type RoutingRule,
+  type RoutingSnapshot,
+  withServiceTimeout,
+} from "../platform/services";
+import { startSerialPoll } from "../platform/serialPoll";
+import { isDesktopRuntime } from "../platform/runtime";
+import type { HomeAdapter } from "../state/useEngineState";
+import { groupConnectionsByAdapter, groupConnectionsByProcess } from "./connectionGroups";
+import {
+  selectConnections,
+  type ConnectionOutboundFilter,
+} from "./connectionView";
+import {
+  type ConnectionSort,
+  type ConnectionSortKey,
+} from "./connectionSort";
+import { routingRuleIdentity } from "./routingBatch";
+import { routingApplyState } from "./routingEffect";
+
+type QuickRuleMatchType = "process" | "domain" | "ip";
+
+type QuickRuleCandidate = {
+  matchType: QuickRuleMatchType;
+  value: string;
+};
+
+type ConnectionContextMenu = {
+  connection: ConnectionView;
+  x: number;
+  y: number;
+};
+
+type QuickRuleSelection = QuickRuleCandidate & {
+  connection: ConnectionView;
+};
+
+export const connectionRuleCandidates = (connection: ConnectionView): QuickRuleCandidate[] => {
+  const candidates: QuickRuleCandidate[] = [
+    { matchType: "process", value: connection.process?.trim() ?? "" },
+    { matchType: "domain", value: connection.domain?.trim() ?? "" },
+    { matchType: "ip", value: connection.remote_ip?.trim() ?? "" },
+  ];
+  return candidates.filter((candidate) => candidate.value.length > 0);
+};
+
+export const preferredConnectionRuleOutbound = (
+  connection: ConnectionView,
+  outbounds: RoutingSnapshot["outbounds"],
+) => {
+  const available = outbounds ?? [];
+  if (available.some((outbound) => outbound.id === connection.outbound)) return connection.outbound;
+  if (connection.outbound === "adapter") {
+    const adapterNames = [connection.outbound_detail, connection.adapter]
+      .map((value) => value?.trim().toLocaleLowerCase())
+      .filter(Boolean);
+    const adapterOutbound = available.find((outbound) => {
+      const label = outbound.label.trim().toLocaleLowerCase();
+      const id = outbound.id.replace(/^nic_/, "").trim().toLocaleLowerCase();
+      return adapterNames.includes(label) || adapterNames.includes(id);
+    });
+    if (adapterOutbound) return adapterOutbound.id;
+  }
+  return available.some((outbound) => outbound.id === "aggregation")
+    ? "aggregation"
+    : available[0]?.id ?? "";
+};
+
+const emptySnapshot: ConnectionListSnapshot = {
+  phase: "stopped",
+  mode: "tun",
+  sampled_at: "",
+  connections: [],
+};
+
+const formatBytes = (value: number) => {
+  if (value >= 1024 * 1024 * 1024) return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  if (value >= 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+  if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${Math.max(0, value)} B`;
+};
+
+const formatDuration = (startedAt: string, now: number) => {
+  const started = new Date(startedAt).getTime();
+  if (!Number.isFinite(started)) return "—";
+  const seconds = Math.max(0, Math.floor((now - started) / 1000));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remaining = seconds % 60;
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remaining).padStart(2, "0")}`
+    : `${minutes}:${String(remaining).padStart(2, "0")}`;
+};
+
+// Only this small cell ticks; scrolling and telemetry do not rebuild the page each second.
+function ConnectionDuration({ startedAt }: { startedAt: string }) {
+  const active = usePageActive();
+  const ref = useRef<HTMLElement>(null);
+  const visible = useRef(true);
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    if (!active) return;
+    const tick = () => { if (visible.current && !document.hidden) setNow(Date.now()); };
+    tick();
+    const observer = typeof IntersectionObserver === "undefined" ? null : new IntersectionObserver(entries => {
+      visible.current = entries.some(entry => entry.isIntersecting);
+      tick();
+    });
+    if (ref.current) observer?.observe(ref.current);
+    const timer = window.setInterval(tick, 1000);
+    return () => { window.clearInterval(timer); observer?.disconnect(); };
+  }, [active]);
+  return <strong ref={ref}>{formatDuration(startedAt, now)}</strong>;
+}
+
+export function ConnectionsPage({
+  initialAdapter = "",
+  adapterRevision = 0,
+  adapterRuntime = [],
+}: {
+  initialAdapter?: string;
+  adapterRevision?: number;
+  adapterRuntime?: readonly HomeAdapter[];
+}) {
+  const pageActive = usePageActive();
+  const { locale } = useI18n();
+  const text = useCallback((zh: string, en: string) => locale === "en" ? en : zh, [locale]);
+  const [snapshot, setSnapshot] = useState<ConnectionListSnapshot>(emptySnapshot);
+  const [hasSnapshot, setHasSnapshot] = useState(false);
+  const [loadError, setLoadError] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [live, setLive] = useState(true);
+  const [query, setQuery] = useState("");
+  const [groupProcesses, setGroupProcesses] = useState(true);
+  const [expandedProcesses, setExpandedProcesses] = useState<Set<string>>(() => new Set());
+  const [outboundFilter, setOutboundFilter] = useState<ConnectionOutboundFilter>("all");
+  const [adapterFilter, setAdapterFilter] = useState(initialAdapter.trim());
+  const [sort, setSort] = useState<ConnectionSort>({ key: "duration", direction: "descending" });
+  const [contextMenu, setContextMenu] = useState<ConnectionContextMenu | null>(null);
+  const [quickRule, setQuickRule] = useState<QuickRuleSelection | null>(null);
+  // Retain the content during Fluent's exit animation to avoid a collapsing dialog.
+  const [quickRuleOpen, setQuickRuleOpen] = useState(false);
+  const [quickRuleSnapshot, setQuickRuleSnapshot] = useState<RoutingSnapshot>({
+    rules: [],
+    outbounds: [],
+    restart_required: false,
+  });
+  const [quickRuleOutbound, setQuickRuleOutbound] = useState("");
+  const [quickRulePreview, setQuickRulePreview] = useState<RoutingBatchPreview | null>(null);
+  const [quickRuleLoading, setQuickRuleLoading] = useState(false);
+  const [quickRuleSaving, setQuickRuleSaving] = useState(false);
+  const [quickRuleSaveError, setQuickRuleSaveError] = useState("");
+  const requestActive = useRef(false);
+  const connectionListRef = useRef<HTMLDivElement>(null);
+  const contextMenuTargetRef = useRef<HTMLSpanElement>(null);
+  const contextMenuOriginRef = useRef<HTMLElement | null>(null);
+  const restoreFocusTarget = useRestoreFocusTarget();
+  const sortStatusId = useId();
+  const quickRuleRequest = useRef(0);
+  const pendingScrollTop = useRef<number | null>(null);
+  const { notify } = useAppNotifications();
+  const groupedByAdapter = adapterFilter.length > 0;
+  const preview = import.meta.env.DEV && !isDesktopRuntime()
+    && new URLSearchParams(window.location.search).get("fixture") === "connections";
+
+  useEffect(() => {
+    setAdapterFilter(initialAdapter.trim());
+    setQuery("");
+    setOutboundFilter("all");
+  }, [adapterRevision, initialAdapter]);
+
+  const textRef = useRef(text);
+  textRef.current = text;
+
+  const load = useCallback(async (manual = false) => {
+    if (requestActive.current) return;
+    requestActive.current = true;
+    if (manual) setRefreshing(true);
+    try {
+      const next = preview
+        ? (await import("./connectionPreview")).createConnectionPreview()
+        : await withServiceTimeout(
+        appServices.engine.connections(),
+        8_000,
+        textRef.current("读取活动连接", "Loading active connections"),
+      );
+      pendingScrollTop.current = connectionListRef.current?.scrollTop ?? null;
+      setSnapshot({ ...next, connections: next.connections ?? [] });
+      setHasSnapshot(true);
+      setLoadError(false);
+    } catch (error) {
+      setLoadError(true);
+      notify({
+        title: textRef.current("无法读取活动连接", "Unable to load active connections"),
+        message: error instanceof Error ? error.message : String(error),
+        intent: "error",
+        dedupeKey: "connections:load-error",
+      });
+    } finally {
+      requestActive.current = false;
+      setLoading(false);
+      setRefreshing(false);
+    }
+  }, [notify, preview]);
+
+  useEffect(() => {
+    if (pageActive) void load();
+  }, [load, pageActive]);
+
+  useEffect(() => {
+    if (!live || !pageActive) return;
+    return startSerialPoll(() => document.hidden ? Promise.resolve() : load(), 1500);
+  }, [live, load, pageActive]);
+
+  useLayoutEffect(() => {
+    const list = connectionListRef.current;
+    const savedScrollTop = pendingScrollTop.current;
+    if (!list || savedScrollTop === null) return;
+    list.scrollTop = Math.min(savedScrollTop, Math.max(0, list.scrollHeight - list.clientHeight));
+    pendingScrollTop.current = null;
+  }, [snapshot]);
+
+  const filtered = useMemo(
+    () => selectConnections(snapshot.connections, query, outboundFilter, adapterFilter, sort),
+    [adapterFilter, outboundFilter, query, snapshot.connections, sort],
+  );
+
+  const totals = useMemo(() => snapshot.connections.reduce(
+    (current, connection) => ({
+      up: current.up + connection.bytes_up,
+      down: current.down + connection.bytes_down,
+    }),
+    { up: 0, down: 0 },
+  ), [snapshot.connections]);
+
+  const hasSingleAdapterRouting = useMemo(
+    () => snapshot.connections.some((connection) => connection.outbound === "adapter"),
+    [snapshot.connections],
+  );
+
+  useEffect(() => {
+    if (!loading && outboundFilter === "adapter" && !hasSingleAdapterRouting) {
+      setOutboundFilter("all");
+    }
+  }, [hasSingleAdapterRouting, loading, outboundFilter]);
+
+  const groups = useMemo(
+    () => groupedByAdapter ? groupConnectionsByAdapter(filtered, adapterRuntime) : [],
+    [adapterRuntime, filtered, groupedByAdapter],
+  );
+
+  const processGroups = useMemo(() => groupConnectionsByProcess(filtered, sort), [filtered, sort]);
+  const toggleProcess = (key: string) => setExpandedProcesses((previous) => {
+    const next = new Set(previous);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    return next;
+  });
+
+  const policy = (connection: ConnectionView) => {
+    if (connection.outbound === "direct") {
+      return { label: text("直连", "Direct"), color: "success" as const };
+    }
+    if (connection.outbound === "adapter") {
+      return {
+        label: text(`单网卡分流 · ${connection.outbound_detail || connection.adapter || "—"}`, `Single-NIC route · ${connection.outbound_detail || connection.adapter || "—"}`),
+        color: "informative" as const,
+      };
+    }
+    return { label: text("多网卡聚合", "Aggregated"), color: "brand" as const };
+  };
+
+  const matchTypeLabel = useCallback((matchType: QuickRuleMatchType) => ({
+    process: text("进程", "Process"),
+    domain: text("域名", "Domain"),
+    ip: "IP",
+  })[matchType], [text]);
+
+  const outboundLabel = useCallback((id: string, outbounds = quickRuleSnapshot.outbounds ?? []) => {
+    if (id === "aggregation") return text("多网卡聚合", "Aggregated");
+    if (id === "direct") return text("直连 / 绕过", "Direct / bypass");
+    return outbounds.find((outbound) => outbound.id === id)?.label ?? id.replace(/^nic_/, "");
+  }, [quickRuleSnapshot.outbounds, text]);
+
+  const loadQuickRulePreview = useCallback(async (
+    selection: QuickRuleSelection,
+    outbound: string,
+    rules: RoutingRule[],
+    request: number,
+  ) => {
+    try {
+      const preview = await appServices.routing.previewBatch(
+        selection.matchType,
+        [selection.value],
+        outbound,
+        rules,
+      );
+      if (quickRuleRequest.current === request) {
+        setQuickRulePreview({ ...preview, items: preview.items ?? [] });
+      }
+    } catch (error) {
+      if (quickRuleRequest.current !== request) return;
+      setQuickRulePreview(null);
+      notify({
+        title: text("无法检查分流规则", "Unable to check routing rule"),
+        message: error instanceof Error ? error.message : String(error),
+        intent: "error",
+        dedupeKey: "connections:quick-rule-preview",
+      });
+    }
+  }, [notify, text]);
+
+  const openQuickRule = useCallback(async (candidate: QuickRuleCandidate, connection: ConnectionView) => {
+    const selection = { ...candidate, connection };
+    const request = quickRuleRequest.current + 1;
+    quickRuleRequest.current = request;
+    setContextMenu(null);
+    setQuickRuleSaveError("");
+    setQuickRule(selection);
+    setQuickRuleOpen(true);
+    setQuickRuleLoading(true);
+    setQuickRulePreview(null);
+    try {
+      const routingSnapshot = await appServices.routing.snapshot();
+      if (quickRuleRequest.current !== request) return;
+      const normalizedSnapshot = {
+        ...routingSnapshot,
+        rules: routingSnapshot.rules ?? [],
+        outbounds: routingSnapshot.outbounds ?? [],
+      };
+      const outbound = preferredConnectionRuleOutbound(connection, normalizedSnapshot.outbounds);
+      setQuickRuleSnapshot(normalizedSnapshot);
+      setQuickRuleOutbound(outbound);
+      if (outbound) {
+        await loadQuickRulePreview(selection, outbound, normalizedSnapshot.rules, request);
+      }
+    } catch (error) {
+      if (quickRuleRequest.current !== request) return;
+      notify({
+        title: text("无法读取分流规则", "Unable to load routing rules"),
+        message: error instanceof Error ? error.message : String(error),
+        intent: "error",
+        dedupeKey: "connections:quick-rule-load",
+      });
+      setQuickRuleOpen(false);
+    } finally {
+      if (quickRuleRequest.current === request) setQuickRuleLoading(false);
+    }
+  }, [loadQuickRulePreview, notify, text]);
+
+  const changeQuickRuleOutbound = useCallback((outbound: string) => {
+    if (!quickRule) return;
+    const request = quickRuleRequest.current + 1;
+    quickRuleRequest.current = request;
+    setQuickRuleOutbound(outbound);
+    setQuickRulePreview(null);
+    setQuickRuleLoading(true);
+    void loadQuickRulePreview(
+      quickRule,
+      outbound,
+      quickRuleSnapshot.rules ?? [],
+      request,
+    ).finally(() => {
+      if (quickRuleRequest.current === request) setQuickRuleLoading(false);
+    });
+  }, [loadQuickRulePreview, quickRule, quickRuleSnapshot.rules]);
+
+  const saveQuickRule = useCallback(async () => {
+    if (!quickRule || !quickRuleOutbound || quickRuleSaving) return;
+    setQuickRuleSaveError("");
+    setQuickRuleSaving(true);
+    try {
+      // Preserve the order and compare the revision at commit time: AI/MCP or
+      // another editor can still write while the preview is being calculated.
+      const latest = await appServices.routing.snapshot();
+      const latestRules = latest.rules ?? [];
+      const preview = await appServices.routing.previewBatch(
+        quickRule.matchType,
+        [quickRule.value],
+        quickRuleOutbound,
+        latestRules,
+      );
+      const item = preview.items?.[0];
+      if (!item || item.status === "invalid") {
+        setQuickRulePreview({ ...preview, items: preview.items ?? [] });
+        throw new Error(item?.message || text("规则内容无效", "The rule value is invalid"));
+      }
+      if (item.status === "duplicate") {
+        setQuickRuleOpen(false);
+        notify({
+          title: text("规则已经存在", "Rule already exists"),
+          message: text("没有修改现有规则。", "Existing rules were left unchanged."),
+          intent: "info",
+          dedupeKey: "connections:quick-rule-duplicate",
+        });
+        return;
+      }
+      const confirmedItem = quickRulePreview?.items?.[0];
+      if (item.status === "conflict" && (confirmedItem?.status !== "conflict"
+        || confirmedItem.existing_outbound !== item.existing_outbound)) {
+        setQuickRuleSnapshot(latest);
+        setQuickRulePreview(preview);
+        notify({
+          title: text("现有规则已变化", "Existing rule changed"),
+          message: text("请查看最新冲突后再次确认更新。", "Review the latest conflict before confirming the update."),
+          intent: "warning",
+          dedupeKey: "connections:quick-rule-changed",
+        });
+        return;
+      }
+      const identity = routingRuleIdentity(item.rule.match_type, item.rule.value);
+      const nextRules = item.status === "conflict"
+        ? latestRules.filter((rule) => routingRuleIdentity(rule.match_type, rule.value) !== identity)
+        : [...latestRules];
+      nextRules.push(item.rule);
+      const saved = await appServices.routing.save(nextRules, latest.match_order ?? undefined, latest.revision ?? "");
+      const applyState = routingApplyState(saved, snapshot.phase, snapshot.mode);
+      setQuickRuleOpen(false);
+      const savedRule = `${matchTypeLabel(quickRule.matchType)} ${item.rule.value} ${text("已指向", "now uses ")}${outboundLabel(quickRuleOutbound, latest.outbounds ?? [])}`;
+      const applyMessage = applyState === "hot_reloaded"
+        ? text(`${savedRule}；新连接立即生效。`, `${savedRule}; new connections take effect immediately.`)
+        : applyState === "restart_required"
+          ? saved.restart_reason === "enable_fakeip"
+            ? text(`${savedRule}；请重启聚合以启用域名分流所需的 DNS 配置。`, `${savedRule}; restart aggregation to enable the DNS configuration required for domain routing.`)
+            : text(`${savedRule}；请重启聚合以完整加载这项更改。`, `${savedRule}; restart aggregation to load this change completely.`)
+          : applyState === "inactive_mode"
+            ? text(`${savedRule}；分流规则仅由 TUN 模式加载，当前系统代理流量不会切换出口。`, `${savedRule}; routing rules are loaded only in TUN mode, so current system-proxy traffic will not switch egress.`)
+            : text(`${savedRule}；将在下次启动 TUN 模式时生效。`, `${savedRule}; it will take effect the next time TUN mode starts.`);
+      notify({
+        title: item.status === "conflict"
+          ? text("分流规则已更新", "Routing rule updated")
+          : text("分流规则已添加", "Routing rule added"),
+        message: applyMessage,
+        intent: applyState === "hot_reloaded" ? "success" : applyState === "restart_required" ? "warning" : "info",
+        dedupeKey: `connections:quick-rule-saved:${identity}`,
+      });
+    } catch (error) {
+      setQuickRuleSaveError(error instanceof Error ? error.message : String(error));
+      notify({
+        title: text("无法保存分流规则", "Unable to save routing rule"),
+        message: error instanceof Error ? error.message : String(error),
+        intent: "error",
+        dedupeKey: "connections:quick-rule-save",
+      });
+    } finally {
+      setQuickRuleSaving(false);
+    }
+  }, [matchTypeLabel, notify, outboundLabel, quickRule, quickRuleOutbound, quickRulePreview, quickRuleSaving, snapshot.mode, snapshot.phase, text]);
+
+  const engineRunning = snapshot.phase === "running";
+  const hasViewFilter = query.trim().length > 0 || outboundFilter !== "all" || groupedByAdapter;
+  const columns: Array<{
+    key: ConnectionSortKey;
+    label: string;
+    defaultDirection: ConnectionSort["direction"];
+  }> = [
+    { key: "process", label: text("进程", "Process"), defaultDirection: "ascending" },
+    { key: "destination", label: text("目标", "Destination"), defaultDirection: "ascending" },
+    { key: "policy", label: text("出口策略", "Egress policy"), defaultDirection: "ascending" },
+    { key: "traffic", label: text("流量", "Traffic"), defaultDirection: "descending" },
+    { key: "duration", label: text("时长", "Duration"), defaultDirection: "descending" },
+  ];
+  const activeSortColumn = columns.find((column) => column.key === sort.key) ?? columns[4];
+  const sortSummary = text(
+    `${activeSortColumn.label} · ${sort.direction === "ascending" ? "升序" : "降序"}`,
+    `${activeSortColumn.label} · ${sort.direction === "ascending" ? "Ascending" : "Descending"}`,
+  );
+
+  const renderConnection = (connection: ConnectionView) => {
+    const outbound = policy(connection);
+    const identity = connection.process || connection.domain || connection.remote_ip || connection.target;
+    const identitySource = connection.process
+      ? `${connection.protocol.toUpperCase()} · ${connection.client || "—"}`
+      : connection.domain
+        ? text("按目标域名显示", "Shown by destination domain")
+        : connection.remote_ip || connection.target
+          ? text("按远端 IP 显示", "Shown by remote IP")
+          : text("未识别连接", "Unidentified connection");
+    return (
+      <article
+        {...restoreFocusTarget}
+        className={`connection-row${contextMenu?.connection.id === connection.id ? " is-context-active" : ""}`}
+        key={connection.id}
+        tabIndex={0}
+        aria-label={text(`连接 ${identity || "未识别"}`, `Connection ${identity || "unidentified"}`)}
+        title={text("右键可快速添加分流规则", "Right-click to quickly add a routing rule")}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          contextMenuOriginRef.current = event.currentTarget;
+          event.currentTarget.focus({ preventScroll: true });
+          setContextMenu({ connection, x: event.clientX, y: event.clientY });
+        }}
+        onKeyDown={(event) => {
+          if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+          event.preventDefault();
+          contextMenuOriginRef.current = event.currentTarget;
+          const bounds = event.currentTarget.getBoundingClientRect();
+          setContextMenu({ connection, x: bounds.left + 42, y: bounds.top + 42 });
+        }}
+      >
+        <div className="connection-process">
+          <span className="connection-process-icon"><AppsListDetail24Regular /></span>
+          <span>
+            <strong>{identity || text("未识别连接", "Unidentified connection")}</strong>
+            <small>{identitySource}</small>
+          </span>
+        </div>
+        <div className="connection-destination">
+          <strong>{connection.domain || connection.remote_ip || connection.target || "—"}</strong>
+          <small>{connection.remote_ip && connection.domain ? `${connection.remote_ip}:${connection.remote_port || ""}` : connection.target || "—"}</small>
+        </div>
+        <div className="connection-policy">
+          <Badge appearance="tint" color={outbound.color}>{outbound.label}</Badge>
+          <small>{connection.adapter
+            ? text(`实际出口：${connection.adapter}`, `Actual egress: ${connection.adapter}`)
+            : text("出口待建立", "Egress pending")}</small>
+        </div>
+        <div className="connection-traffic">
+          <span><ArrowUpload20Regular /> {formatBytes(connection.bytes_up)}</span>
+          <span><ArrowDownload20Regular /> {formatBytes(connection.bytes_down)}</span>
+        </div>
+        <div className="connection-duration">
+          <ConnectionDuration startedAt={connection.started_at} />
+          <small>{new Date(connection.started_at).toLocaleTimeString(locale === "en" ? "en-US" : "zh-CN", { hour12: false })}</small>
+        </div>
+      </article>
+    );
+  };
+
+  const connectionRows = (items: readonly ConnectionView[], scope = "", child = false): VirtualRow[] => items.map(connection => ({
+    key: `connection:${scope}/${connection.id}`,
+    estimate: child ? 62 : 72,
+    render: () => child ? <div className="connection-group-children">{renderConnection(connection)}</div> : renderConnection(connection),
+  }));
+  const processRows = (items: ReturnType<typeof groupConnectionsByProcess>, scope = ""): VirtualRow[] => items.flatMap((group) => {
+    if (group.connections.length === 1) return connectionRows(group.connections, scope);
+    const key = `${scope}/${group.key}`;
+    const expanded = expandedProcesses.has(key);
+    const targets = new Set(group.connections.map((connection) => connection.domain || connection.remote_ip || connection.target));
+    const policies = new Set(group.connections.map((connection) => policy(connection).label));
+    const adapters = [...new Set(group.connections.map((connection) => connection.adapter).filter(Boolean))];
+    const outbound = policy(group.summary);
+    return [{ key: `process:${key}`, estimate: 73, render: () => (
+      <section className={`connection-process-group${expanded ? " is-expanded" : ""}`} key={group.key}>
+        <button type="button" className="connection-row connection-group-toggle"
+          aria-expanded={expanded}
+          aria-label={text(`${expanded ? "收起" : "展开"} ${group.summary.process} 的 ${group.connections.length} 条连接`, `${expanded ? "Collapse" : "Expand"} ${group.summary.process}, ${group.connections.length} connections`)}
+          onClick={() => toggleProcess(key)}>
+          <span className="connection-process">
+            <ChevronRight16Regular className="connection-group-chevron" />
+            <span className="connection-process-icon"><AppsListDetail24Regular /></span>
+            <span><strong title={group.summary.process}>{group.summary.process}</strong><small>{text(`${group.connections.length} 条连接 · ${expanded ? "点击收起" : "点击展开"}`, `${group.connections.length} connections · ${expanded ? "Collapse" : "Expand"}`)}</small></span>
+          </span>
+          <span className="connection-destination"><strong>{text(`${targets.size} 个目标`, `${targets.size} destinations`)}</strong><small>{[...new Set(group.connections.map((connection) => connection.protocol.toUpperCase()))].join(" / ")}</small></span>
+          <span className="connection-policy"><Badge appearance="tint" color={policies.size === 1 ? outbound.color : "informative"}>{policies.size === 1 ? outbound.label : text(`${policies.size} 种出口策略`, `${policies.size} egress policies`)}</Badge><small title={adapters.join(" / ")}>{adapters.join(" / ") || text("出口待建立", "Egress pending")}</small></span>
+          <span className="connection-traffic"><span><ArrowUpload20Regular /> {formatBytes(group.summary.bytes_up)}</span><span><ArrowDownload20Regular /> {formatBytes(group.summary.bytes_down)}</span></span>
+          <span className="connection-duration"><ConnectionDuration startedAt={group.summary.started_at} /><small>{text("最长连接", "Longest")}</small></span>
+        </button>
+      </section>
+    ) }, ...expanded ? connectionRows(group.connections, key, true) : []];
+  });
+
+  const rows: VirtualRow[] = groupedByAdapter ? groups.flatMap(group => [{
+    key: `adapter:${group.adapter}`, estimate: 38,
+    render: () => <div className="connection-adapter-heading">
+      <span><PlugConnected20Regular /><strong>{group.adapter || text("出口待分配", "Egress pending")}</strong><small>{text(`${group.connections.length} 条连接`, `${group.connections.length} connection(s)`)}</small></span>
+      <span className="connection-adapter-speed"><span><ArrowDownload20Regular /> {formatBytes(Math.round(group.downloadBPS))}/s</span><span><ArrowUpload20Regular /> {formatBytes(Math.round(group.uploadBPS))}/s</span></span>
+    </div>,
+  }, ...groupProcesses ? processRows(groupConnectionsByProcess(group.connections, sort), group.adapter) : connectionRows(group.connections, group.adapter)])
+    : groupProcesses ? processRows(processGroups) : connectionRows(filtered);
+
+  return (
+    <main className="connections-page">
+      <PageHeader
+        kicker={text("当前加速会话的实时网络流", "Live network flows in this acceleration session")}
+        title={text("活动连接", "Active connections")}
+        description={text(
+          "按进程查看目标域名、远端 IP、实际出口网卡、分流策略与会话流量。",
+          "Inspect destination domains, remote IPs, actual egress adapters, routing policy, and session traffic by process.",
+        )}
+        actions={<div className="connections-heading-actions">
+          <SearchBox
+            aria-label={text("搜索活动连接", "Search active connections")}
+            dismiss={{ "aria-label": text("清空搜索", "Clear search") }}
+            autoComplete="off"
+            spellCheck={false}
+            value={query}
+            placeholder={text("搜索进程、域名、IP 或网卡", "Search process, domain, IP, or adapter")}
+            onChange={(_, data) => setQuery(data.value)}
+          />
+          <Switch
+            checked={live}
+            label={text("实时刷新", "Live")}
+            onChange={(_, data) => setLive(data.checked)}
+          />
+          <Button
+            appearance="secondary"
+            icon={refreshing ? <Spinner size="tiny" /> : <ArrowSync20Regular />}
+            disabled={refreshing}
+            onClick={() => void load(true)}
+          >
+            {text("刷新", "Refresh")}
+          </Button>
+        </div>}
+      />
+
+      <GlassSurface className="connection-summary" tone="secondary">
+        {preview && <Badge appearance="tint" color="warning">{text("预览 · 示例数据", "Preview · Sample data")}</Badge>}
+        <span>
+          <Badge key={!hasSnapshot ? "unknown" : engineRunning ? "running" : "stopped"} className="motion-status-swap" appearance="tint" color={loadError ? "warning" : engineRunning ? "success" : "informative"}>
+            {!hasSnapshot ? text("引擎状态未知", "Engine status unknown") : engineRunning ? text("聚合运行中", "Engine running") : text("聚合未运行", "Engine stopped")}
+          </Badge>
+        </span>
+        <span><PlugConnected20Regular /> <strong>{hasSnapshot ? snapshot.connections.length : "—"}</strong> {text("条活动连接", "active")}</span>
+        <span><ArrowUpload20Regular /> <strong>{hasSnapshot ? formatBytes(totals.up) : "—"}</strong> {text("上传", "uploaded")}</span>
+        <span><ArrowDownload20Regular /> <strong>{hasSnapshot ? formatBytes(totals.down) : "—"}</strong> {text("下载", "downloaded")}</span>
+        <small>{snapshot.sampled_at
+          ? text(`采样于 ${new Date(snapshot.sampled_at).toLocaleTimeString("zh-CN", { hour12: false })}`, `Sampled ${new Date(snapshot.sampled_at).toLocaleTimeString("en-US")}`)
+          : text("等待 Core 遥测", "Waiting for Core telemetry")}</small>
+      </GlassSurface>
+
+      {loadError && <MessageBar className="connections-load-error" intent="warning"><MessageBarBody>
+        {hasSnapshot
+          ? text("无法刷新活动连接；下方保留最近一次成功采样，数据可能已过期。点击“刷新”重试。", "Unable to refresh connections; showing the last successful sample, which may be stale. Select Refresh to retry.")
+          : text("无法读取活动连接，暂时无法确认引擎状态。点击“刷新”重试。", "Unable to load connections or confirm engine status. Select Refresh to retry.")}
+      </MessageBarBody></MessageBar>}
+
+      <GlassSurface className={`connections-surface${loading || filtered.length === 0 ? " is-empty" : ""}`}>
+        <div className="connection-view-toolbar">
+          <span className="connection-view-result">
+            <Filter20Regular />
+            <span>{text(`显示 ${filtered.length} / ${snapshot.connections.length}`, `Showing ${filtered.length} of ${snapshot.connections.length}`)}</span>
+            <span id={sortStatusId} className="connection-sort-summary" role="status" aria-live="polite">
+              {sortSummary}
+              <span aria-hidden="true">{sort.direction === "ascending" ? "↑" : "↓"}</span>
+            </span>
+          </span>
+          <div className="connection-view-controls">
+            <Switch checked={groupProcesses} label={text("合并同名进程", "Group by process")}
+              onChange={(_, data) => setGroupProcesses(data.checked)} />
+            {groupProcesses && filtered.length > 0 && <Button size="small" appearance="subtle"
+              onClick={() => setExpandedProcesses(new Set())}>{text("全部收起", "Collapse all")}</Button>}
+            {groupedByAdapter && (
+              <div
+                className="connection-adapter-filter"
+                role="group"
+                aria-label={text("适配器筛选", "Adapter filter")}
+              >
+                <span>{text("适配器", "Adapter")}</span>
+                <Badge appearance="tint" color="brand" title={adapterFilter}>{adapterFilter}</Badge>
+                <Button
+                  appearance="subtle"
+                  size="small"
+                  icon={<Dismiss16Regular />}
+                  aria-label={text(`清除适配器筛选 ${adapterFilter}`, `Clear adapter filter ${adapterFilter}`)}
+                  onClick={() => setAdapterFilter("")}
+                >
+                  {text("清除", "Clear")}
+                </Button>
+              </div>
+            )}
+            <label>
+              <span>{text("出口策略", "Egress")}</span>
+              <Dropdown
+                size="small"
+                positioning={{ position: "below", align: "end", pinned: true, strategy: "fixed", offset: 4 }}
+                aria-label={text("按出口策略筛选", "Filter by egress policy")}
+                value={{
+                  all: text("全部出口", "All egress"),
+                  aggregation: text("多网卡聚合", "Aggregated"),
+                  direct: text("直连", "Direct"),
+                  adapter: text("单网卡分流", "Single-NIC routing"),
+                }[outboundFilter]}
+                selectedOptions={[outboundFilter]}
+                onOptionSelect={(_, data) => data.optionValue && setOutboundFilter(data.optionValue as ConnectionOutboundFilter)}
+              >
+                <Option value="all">{text("全部出口", "All egress")}</Option>
+                <Option value="aggregation">{text("多网卡聚合", "Aggregated")}</Option>
+                <Option value="direct">{text("直连", "Direct")}</Option>
+                {hasSingleAdapterRouting && (
+                  <Option value="adapter">{text("单网卡分流", "Single-NIC routing")}</Option>
+                )}
+              </Dropdown>
+            </label>
+          </div>
+        </div>
+        <div className="connection-table-head" role="group" aria-label={text("连接排序", "Sort connections")}>
+          {columns.map((column) => {
+            const direction = sort.key === column.key ? sort.direction : undefined;
+            const nextDirection = direction
+              ? direction === "ascending" ? "descending" : "ascending"
+              : column.defaultDirection;
+            const sortAction = text(
+              `按${column.label}${nextDirection === "ascending" ? "升序" : "降序"}排序`,
+              `Sort ${column.label} ${nextDirection}`,
+            );
+            return (
+              <span key={column.key}>
+                <button
+                  type="button"
+                  className={`connection-sort-button${direction ? " is-active" : ""}`}
+                  aria-label={text(`按${column.label}排序`, `Sort by ${column.label}`)}
+                  aria-pressed={Boolean(direction)}
+                  aria-describedby={direction ? sortStatusId : undefined}
+                  title={sortAction}
+                  onClick={() => setSort({ key: column.key, direction: nextDirection })}
+                >
+                  <span>{column.label}</span>
+                  <span
+                    className={`connection-sort-indicator${direction ? ` is-${direction}` : " is-idle"}`}
+                    aria-hidden="true"
+                  >
+                    {direction ? "↑" : "↕"}
+                  </span>
+                </button>
+              </span>
+            );
+          })}
+        </div>
+        <div {...restoreFocusTarget} ref={connectionListRef} className="connection-list" role="region" aria-label={text("活动连接列表", "Active connections list")} tabIndex={0}>
+          {loading ? (
+            <div key="connections-loading" className="connections-empty motion-state-content"><Spinner label={text("正在读取实时连接", "Loading live connections")} /></div>
+          ) : !hasSnapshot ? (
+            <div key="connections-unavailable" className="connections-empty motion-state-content">
+              <AppsListDetail24Regular />
+              <strong>{text("活动连接暂不可用", "Active connections unavailable")}</strong>
+              <span>{text("请刷新重试；读取失败不代表引擎已停止。", "Refresh to retry; a failed read does not mean the engine has stopped.")}</span>
+            </div>
+          ) : !engineRunning ? (
+            <div key="connections-stopped" className="connections-empty motion-state-content">
+              <AppsListDetail24Regular />
+              <strong>{text("聚合引擎尚未运行", "The aggregation engine is not running")}</strong>
+              <span>{text("启动聚合后，这里会实时显示本次会话正在处理的连接。", "Start aggregation to see the connections handled in this session.")}</span>
+            </div>
+          ) : filtered.length === 0 ? (
+            <div key={hasViewFilter ? "connections-no-match" : "connections-idle"} className="connections-empty motion-state-content">
+              <Globe20Regular />
+              <strong>{hasViewFilter ? text("没有符合当前筛选的连接", "No connections match the current filters") : text("当前没有活动连接", "No active connections")}</strong>
+              <span>{hasViewFilter
+                ? text("可以更换出口策略或清空搜索内容。", "Choose another egress policy or clear the search query.")
+                : text("短连接可能只会短暂出现；实时刷新会保留最新状态。", "Short-lived flows may appear briefly; live refresh keeps the view current.")}</span>
+            </div>
+          ) : <VirtualRows rows={rows} scrollRef={connectionListRef} />}
+        </div>
+      </GlassSurface>
+
+      <span
+        ref={contextMenuTargetRef}
+        className="connection-context-anchor"
+        style={{ left: contextMenu?.x ?? 0, top: contextMenu?.y ?? 0 }}
+        aria-hidden="true"
+      />
+      <Menu
+        open={Boolean(contextMenu)}
+        onOpenChange={(_, data) => {
+          if (!data.open) {
+            setContextMenu(null);
+            if (data.keyboard && !contextMenuOriginRef.current?.isConnected) {
+              connectionListRef.current?.focus({ preventScroll: true });
+            }
+          }
+        }}
+        positioning={{ target: contextMenuTargetRef.current, position: "below", align: "start", strategy: "fixed", offset: 4 }}
+      >
+        <MenuPopover className="connection-rule-menu glass-surface" data-tone="primary">
+          <MenuList>
+            <MenuGroup>
+            <MenuGroupHeader className="connection-rule-menu-heading">
+              {text("快速添加分流规则", "Quick add routing rule")}
+            </MenuGroupHeader>
+            {(contextMenu ? connectionRuleCandidates(contextMenu.connection) : []).map((candidate) => (
+              <MenuItem
+                key={candidate.matchType}
+                icon={candidate.matchType === "process"
+                  ? <AppsListDetail24Regular />
+                  : candidate.matchType === "domain"
+                    ? <Globe20Regular />
+                    : <PlugConnected20Regular />}
+                onClick={() => contextMenu && void openQuickRule(candidate, contextMenu.connection)}
+              >
+                <span className="connection-rule-menu-item">
+                  <span>{text(`按${matchTypeLabel(candidate.matchType)}添加`, `Add by ${matchTypeLabel(candidate.matchType).toLocaleLowerCase()}`)}</span>
+                  <small title={candidate.value}>{candidate.value}</small>
+                </span>
+              </MenuItem>
+            ))}
+            </MenuGroup>
+          </MenuList>
+        </MenuPopover>
+      </Menu>
+
+      <Dialog
+        open={quickRuleOpen}
+        onOpenChange={(_, data) => {
+          if (!data.open && !quickRuleSaving) {
+            quickRuleRequest.current += 1;
+            setQuickRuleOpen(false);
+          }
+        }}
+      >
+        <DialogSurface className="routing-batch-dialog quick-rule-dialog glass-surface" data-tone="primary">
+          <DialogBody>
+            <DialogTitle className="routing-batch-title">{text("添加分流规则", "Add routing rule")}</DialogTitle>
+            <DialogContent>
+              {quickRuleSaveError && <MessageBar intent="error"><MessageBarBody>{quickRuleSaveError}</MessageBarBody></MessageBar>}
+              {quickRule && (
+                <>
+                  <div className="quick-rule-summary">
+                    <Badge appearance="tint" color="brand">{matchTypeLabel(quickRule.matchType)}</Badge>
+                    <strong title={quickRule.value}>{quickRule.value}</strong>
+                    <small>{text("来自当前活动连接", "From the active connection")}</small>
+                  </div>
+                  <label className="quick-rule-field">
+                    <span>{text("出口策略", "Egress policy")}</span>
+                    <Dropdown
+                      value={outboundLabel(quickRuleOutbound)}
+                      selectedOptions={quickRuleOutbound ? [quickRuleOutbound] : []}
+                      disabled={quickRuleLoading || quickRuleSaving}
+                      onOptionSelect={(_, data) => data.optionValue && changeQuickRuleOutbound(data.optionValue)}
+                    >
+                      {(quickRuleSnapshot.outbounds ?? []).map((outbound) => (
+                        <Option key={outbound.id} value={outbound.id}>{outboundLabel(outbound.id)}</Option>
+                      ))}
+                    </Dropdown>
+                  </label>
+                  {quickRuleLoading ? (
+                    <div className="quick-rule-status"><Spinner size="tiny" label={text("正在检查规则", "Checking rule")} /></div>
+                  ) : quickRulePreview?.conflict_count ? (
+                    <MessageBar intent="warning">
+                      <MessageBarBody>{text(
+                        `已有相同${matchTypeLabel(quickRule.matchType)}规则指向${outboundLabel(quickRulePreview.items?.[0]?.existing_outbound ?? "")}；保存时只更新这一条。`,
+                        `An identical ${matchTypeLabel(quickRule.matchType).toLocaleLowerCase()} rule currently uses ${outboundLabel(quickRulePreview.items?.[0]?.existing_outbound ?? "")}; only that rule will be updated.`,
+                      )}</MessageBarBody>
+                    </MessageBar>
+                  ) : quickRulePreview?.duplicate_count ? (
+                    <MessageBar intent="info">
+                      <MessageBarBody>{text("这条规则和出口已经存在，不会重复添加。", "This rule and egress already exist; no duplicate will be added.")}</MessageBarBody>
+                    </MessageBar>
+                  ) : quickRulePreview?.invalid_count ? (
+                    <MessageBar intent="error"><MessageBarBody>{quickRulePreview.items?.[0]?.message}</MessageBarBody></MessageBar>
+                  ) : (
+                    <small className="routing-batch-helper">{text(
+                      "保存后自动热更新；已有连接保持当前路径，新连接使用新规则。",
+                      "Rules hot-reload after saving; existing connections keep their path and new connections use the new rule.",
+                    )}</small>
+                  )}
+                </>
+              )}
+            </DialogContent>
+            <DialogActions className="routing-batch-actions">
+              <Button disabled={quickRuleSaving} onClick={() => {
+                quickRuleRequest.current += 1;
+                setQuickRuleOpen(false);
+              }}>{text("取消", "Cancel")}</Button>
+              <Button
+                appearance="primary"
+                icon={quickRuleSaving ? <Spinner size="tiny" /> : <Add20Regular />}
+                disabled={quickRuleLoading || quickRuleSaving || !quickRuleOutbound || Boolean(quickRulePreview?.invalid_count || quickRulePreview?.duplicate_count)}
+                onClick={() => void saveQuickRule()}
+              >
+                {quickRulePreview?.conflict_count ? text("更新规则", "Update rule") : text("添加规则", "Add rule")}
+              </Button>
+            </DialogActions>
+          </DialogBody>
+        </DialogSurface>
+      </Dialog>
+    </main>
+  );
+}

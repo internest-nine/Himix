@@ -1,0 +1,392 @@
+package services
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/internest-nine/Himix/desktop/internal/engineclient"
+)
+
+type TunPreflightIssue struct {
+	Code   string `json:"code"`
+	Level  string `json:"level"`
+	Title  string `json:"title"`
+	Detail string `json:"detail"`
+}
+
+type TunPreflightSnapshot struct {
+	Ready                    bool                `json:"ready"`
+	CheckedAt                time.Time           `json:"checked_at"`
+	SelectedAdapterIDs       []string            `json:"selected_adapter_ids"`
+	HostElevated             bool                `json:"host_elevated"`
+	PrivilegeBrokerAvailable bool                `json:"privilege_broker_available"`
+	EngineAvailable          bool                `json:"engine_available"`
+	SingBoxAvailable         bool                `json:"sing_box_available"`
+	WFPReady                 bool                `json:"wfp_ready"`
+	WFPDetail                string              `json:"wfp_detail,omitempty"`
+	StrictRouteRequested     bool                `json:"strict_route_requested"`
+	EffectiveStrictRoute     bool                `json:"effective_strict_route"`
+	ForeignTUN               string              `json:"foreign_tun,omitempty"`
+	SharedGatewayRisks       []string            `json:"shared_gateway_risks"`
+	NetworkRisks             []string            `json:"network_risks"`
+	Issues                   []TunPreflightIssue `json:"issues"`
+}
+
+type tunPlatformSnapshot struct {
+	HostElevated             bool
+	PrivilegeBrokerAvailable bool
+	WFPReady                 bool
+	WFPDetail                string
+	DefaultRouteAliases      []string
+	RouteScanError           string
+	NetworkRisks             []string
+}
+
+const startupPreflightReuseWindow = 8 * time.Second
+
+type startupPreflightCache struct {
+	key       string
+	checkedAt time.Time
+	snapshot  TunPreflightSnapshot
+}
+
+type TunService struct {
+	mu              sync.Mutex
+	settings        *SettingsService
+	adapters        *AdapterService
+	listAdapters    func() ([]AdapterView, error)
+	inspectPlatform func(bool) tunPlatformSnapshot
+	resolveEngine   func() (string, error)
+	resolveSingBox  func() (string, error)
+	now             func() time.Time
+	latest          TunPreflightSnapshot
+	startupCache    startupPreflightCache
+}
+
+func NewTunService(settings *SettingsService, adapters *AdapterService) *TunService {
+	return &TunService{
+		settings:        settings,
+		adapters:        adapters,
+		listAdapters:    adapters.List,
+		inspectPlatform: inspectTunPlatform,
+		resolveEngine:   engineclient.ResolveExecutable,
+		resolveSingBox:  func() (string, error) { return resolveRuntimeAsset("sing-box.exe") },
+		now:             time.Now,
+		latest: TunPreflightSnapshot{
+			CheckedAt: time.Time{}, SharedGatewayRisks: []string{}, Issues: []TunPreflightIssue{},
+		},
+	}
+}
+
+func (s *TunService) Latest() TunPreflightSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return cloneTunPreflight(s.latest)
+}
+
+// Preflight is deliberately read-only. It does not start the engine, create a
+// Wintun adapter, add WFP filters, change routes, or request elevation.
+func (s *TunService) Preflight(adapterIDs []string) (TunPreflightSnapshot, error) {
+	available, err := s.listAdapters()
+	if err != nil {
+		return TunPreflightSnapshot{}, fmt.Errorf("扫描 TUN 网卡失败：%w", err)
+	}
+	wanted := make(map[string]struct{}, len(adapterIDs))
+	for _, id := range adapterIDs {
+		if value := strings.TrimSpace(id); value != "" {
+			wanted[value] = struct{}{}
+		}
+	}
+	selected := make([]AdapterView, 0, len(available))
+	for _, adapter := range available {
+		_, explicitlySelected := wanted[adapter.ID]
+		if (len(wanted) == 0 && adapter.Selected) || explicitlySelected {
+			adapter.Selected = true
+			selected = append(selected, adapter)
+		}
+	}
+	return s.evaluateSelected(selected, true), nil
+}
+
+func (s *TunService) checkSelected(selected []AdapterView) TunPreflightSnapshot {
+	return s.evaluateSelected(selected, false)
+}
+
+func (s *TunService) evaluateSelected(selected []AdapterView, reusableForStartup bool) TunPreflightSnapshot {
+	settings := s.settings.Get()
+	rememberedWFPFailure, rememberedWFPDetail := s.settings.rememberedWFPCompatibilityFailure()
+	platform := s.inspectPlatform(settings.StrictRoute && !rememberedWFPFailure)
+	if settings.StrictRoute && rememberedWFPFailure {
+		platform.WFPReady = false
+		platform.WFPDetail = "此设备已有匹配当前 Windows 与 Himix 版本的 WFP 失败记录"
+		if strings.TrimSpace(rememberedWFPDetail) != "" {
+			platform.WFPDetail += "：" + rememberedWFPDetail
+		}
+	}
+	enginePath, engineErr := s.resolveEngine()
+	singBoxPath, singBoxErr := s.resolveSingBox()
+	snapshot := TunPreflightSnapshot{
+		CheckedAt:                s.now().UTC(),
+		HostElevated:             platform.HostElevated,
+		PrivilegeBrokerAvailable: platform.PrivilegeBrokerAvailable,
+		EngineAvailable:          engineErr == nil && enginePath != "",
+		SingBoxAvailable:         singBoxErr == nil && singBoxPath != "",
+		WFPReady:                 platform.WFPReady,
+		WFPDetail:                platform.WFPDetail,
+		StrictRouteRequested:     settings.StrictRoute,
+		EffectiveStrictRoute:     settings.StrictRoute && platform.WFPReady,
+		SharedGatewayRisks:       sharedIPv4GatewayRisks(selected),
+		NetworkRisks:             append([]string(nil), platform.NetworkRisks...),
+		Issues:                   []TunPreflightIssue{},
+	}
+	for _, adapter := range selected {
+		snapshot.SelectedAdapterIDs = append(snapshot.SelectedAdapterIDs, adapter.ID)
+	}
+	sort.Strings(snapshot.SelectedAdapterIDs)
+	if err := validateAdapterSources(selected); err != nil {
+		snapshot.Issues = append(snapshot.Issues, tunBlocker("duplicate_source_ip", "所选网卡源 IP 重复", err.Error()))
+	}
+	if len(selected) == 0 {
+		snapshot.Issues = append(snapshot.Issues, tunBlocker(
+			"no_adapter", "未选择活动网卡", "请至少选择一张具有有效 IPv4 或 IPv6 地址的活动网卡。",
+		))
+	}
+	if err := validateDefaultOutbound(settings.DefaultOutbound, selected); err != nil {
+		snapshot.Issues = append(snapshot.Issues, tunBlocker("default_outbound_unavailable", "全局默认规则的出口不可用", err.Error()))
+	}
+	if !snapshot.EngineAvailable {
+		snapshot.Issues = append(snapshot.Issues, tunBlocker(
+			"engine_missing", "聚合核心不可用", errorDetail(engineErr, "未找到 himix-engine.exe"),
+		))
+	}
+	if !snapshot.SingBoxAvailable {
+		snapshot.Issues = append(snapshot.Issues, tunBlocker(
+			"sing_box_missing", "TUN 侧车不可用", errorDetail(singBoxErr, "未找到 sing-box.exe"),
+		))
+	}
+	if platform.HostElevated {
+		// A verified standard token may not exist (for example on UAC-disabled
+		// systems). The supported compatibility mode is diagnostic context, not
+		// an actionable risk requiring confirmation on every TUN start.
+		snapshot.Issues = append(snapshot.Issues, tunInfo(
+			"elevated_ui_host",
+			"桌面界面使用管理员兼容模式",
+			"当前以管理员权限运行桌面界面。此状态本身不影响 TUN 启动，无需重复确认；高权限网络操作仍由独立聚合核心处理。",
+		))
+	}
+	if !platform.PrivilegeBrokerAvailable {
+		snapshot.Issues = append(snapshot.Issues, tunBlocker(
+			"privilege_broker_unavailable",
+			"未连接高权限聚合核心",
+			"虚拟网卡需要独立权限服务创建 TUN、WFP 与路由资源；本次不会启动出站池，也不会修改系统网络。",
+		))
+	}
+	for _, alias := range platform.DefaultRouteAliases {
+		clean := strings.TrimSpace(alias)
+		if clean == "" {
+			continue
+		}
+		if strings.EqualFold(clean, "Himix-Tun") {
+			snapshot.Issues = append(snapshot.Issues, tunWarning(
+				"stale_himix_tun", "检测到 Himix TUN 残留",
+				"系统仍存在由 Himix-Tun 接管的默认路由；启动时将由高权限聚合核心精确清理并确认设备消失，清理失败则不会继续接管网络。",
+			))
+		} else if snapshot.ForeignTUN == "" {
+			snapshot.ForeignTUN = clean
+			snapshot.Issues = append(snapshot.Issues, tunWarning(
+				"foreign_tun", "第三方虚拟隧道正在接管大范围网络路由",
+				fmt.Sprintf("检测到 %s。路由重叠不代表一定无法共存，仍可继续启动；若实际无法联网，可停止 Himix 或调整对应隧道的路由。", clean),
+			))
+		}
+	}
+	if platform.RouteScanError != "" {
+		snapshot.Issues = append(snapshot.Issues, tunInfo(
+			"route_scan_failed", "部分网络检查未完成", platform.RouteScanError+"；检查未完成不代表网络存在冲突，已完成的检查结果仍然有效。",
+		))
+	}
+	for _, detail := range snapshot.NetworkRisks {
+		if strings.TrimSpace(detail) == "" {
+			continue
+		}
+		snapshot.Issues = append(snapshot.Issues, tunInfo(
+			"foreign_network_risk", "检测到虚拟网络或网络共享环境",
+			detail+"；此信息不代表已发生网络接管冲突，无需仅因此关闭虚拟网卡或共享服务。",
+		))
+	}
+	if settings.StrictRoute && !platform.WFPReady {
+		detail := "WFP 只读预检未通过；用户偏好保持开启，但本次应仅使用兼容 TUN，不能把降级结果写回为用户偏好。"
+		if rememberedWFPFailure {
+			detail = platform.WFPDetail + "；本次直接使用兼容 TUN。点击“重新检测并修复”或升级 Windows/Himix 后会重新尝试。"
+		}
+		snapshot.Issues = append(snapshot.Issues, tunWarning(
+			"wfp_compatibility",
+			"严格路由当前不可用",
+			detail,
+		))
+	}
+	for _, detail := range snapshot.SharedGatewayRisks {
+		snapshot.Issues = append(snapshot.Issues, tunInfo(
+			"shared_lan_gateway", "所选网卡共用子网和默认网关", detail+"；允许继续，但 Windows 无法保证独立出口或带宽聚合。",
+		))
+	}
+	if settings.ForceTUNBypass {
+		// Environmental heuristics never veto an explicitly forced start.
+		// Keep actual prerequisites (files, usable adapters, elevation) intact.
+		for i := range snapshot.Issues {
+			if snapshot.Issues[i].Level == "warning" {
+				snapshot.Issues[i].Level = "info"
+			}
+		}
+		snapshot.Issues = append(snapshot.Issues, tunInfo("force_start", "强制启动已开启",
+			"跳过启动前 DNS 联网验证、启动后联网探测及运行期联网探测；网络可用性请以实际访问为准。"))
+	}
+	snapshot.Ready = true
+	for _, issue := range snapshot.Issues {
+		if issue.Level == "blocker" {
+			snapshot.Ready = false
+			break
+		}
+	}
+	s.mu.Lock()
+	s.latest = cloneTunPreflight(snapshot)
+	if reusableForStartup {
+		s.startupCache = startupPreflightCache{
+			key: tunPreflightCacheKey(
+				selected, settings.StrictRoute, settings.ForceTUNBypass, rememberedWFPFailure, rememberedWFPDetail,
+			) + "\ndefault=" + settings.DefaultOutbound,
+			checkedAt: snapshot.CheckedAt,
+			snapshot:  cloneTunPreflight(snapshot),
+		}
+	} else {
+		s.startupCache = startupPreflightCache{}
+	}
+	s.mu.Unlock()
+	return snapshot
+}
+
+// consumeRecentPreflight reuses only the immediately preceding UI preflight,
+// once, when the selected network identity and strict-route inputs are still
+// identical. The short window removes duplicate PowerShell inspection without
+// turning a diagnostic snapshot into long-lived authorization for takeover.
+func (s *TunService) consumeRecentPreflight(selected []AdapterView) (TunPreflightSnapshot, bool) {
+	settings := s.settings.Get()
+	rememberedWFPFailure, rememberedWFPDetail := s.settings.rememberedWFPCompatibilityFailure()
+	key := tunPreflightCacheKey(
+		selected, settings.StrictRoute, settings.ForceTUNBypass, rememberedWFPFailure, rememberedWFPDetail,
+	) + "\ndefault=" + settings.DefaultOutbound
+	now := s.now().UTC()
+	s.mu.Lock()
+	cached := s.startupCache
+	s.startupCache = startupPreflightCache{}
+	s.mu.Unlock()
+	age := now.Sub(cached.checkedAt)
+	if cached.key == "" || cached.key != key || age < 0 || age > startupPreflightReuseWindow {
+		return TunPreflightSnapshot{}, false
+	}
+	return cloneTunPreflight(cached.snapshot), true
+}
+
+func tunPreflightCacheKey(
+	selected []AdapterView,
+	strictRoute bool,
+	forceStart bool,
+	rememberedWFPFailure bool,
+	rememberedWFPDetail string,
+) string {
+	adapters := append([]AdapterView(nil), selected...)
+	sort.Slice(adapters, func(i, j int) bool { return adapters[i].ID < adapters[j].ID })
+	parts := make([]string, 0, len(adapters)+1)
+	parts = append(parts, fmt.Sprintf(
+		"strict=%t|force=%t|remembered=%t|detail=%s",
+		strictRoute, forceStart, rememberedWFPFailure, strings.TrimSpace(rememberedWFPDetail),
+	))
+	for _, adapter := range adapters {
+		parts = append(parts, fmt.Sprintf(
+			"%s|%s|%d|%d|%s|%d|%s|%t",
+			adapter.ID, adapter.Address, adapter.PrefixLength, adapter.IfIndex,
+			adapter.SourceIPv6, adapter.IPv6IfIndex, adapter.Gateway, adapter.Operational,
+		))
+	}
+	return strings.Join(parts, "\n")
+}
+
+func tunBlocker(code, title, detail string) TunPreflightIssue {
+	return TunPreflightIssue{Code: code, Level: "blocker", Title: title, Detail: detail}
+}
+
+func tunWarning(code, title, detail string) TunPreflightIssue {
+	return TunPreflightIssue{Code: code, Level: "warning", Title: title, Detail: detail}
+}
+
+func tunInfo(code, title, detail string) TunPreflightIssue {
+	return TunPreflightIssue{Code: code, Level: "info", Title: title, Detail: detail}
+}
+
+func errorDetail(err error, fallback string) string {
+	if err == nil {
+		return fallback
+	}
+	return err.Error()
+}
+
+func sharedIPv4GatewayRisks(adapters []AdapterView) []string {
+	var risks []string
+	for leftIndex, left := range adapters {
+		leftNetwork := adapterIPv4Network(left)
+		if leftNetwork == nil || left.Gateway == "" {
+			continue
+		}
+		for _, right := range adapters[leftIndex+1:] {
+			rightNetwork := adapterIPv4Network(right)
+			if rightNetwork == nil || right.Gateway == "" {
+				continue
+			}
+			if leftNetwork.String() == rightNetwork.String() &&
+				strings.EqualFold(primaryGateway(left.Gateway), primaryGateway(right.Gateway)) {
+				risks = append(risks, fmt.Sprintf(
+					"%s 与 %s 同属 %s，且共用网关 %s",
+					left.Name, right.Name, leftNetwork.String(), primaryGateway(left.Gateway),
+				))
+			}
+		}
+	}
+	return risks
+}
+
+func adapterIPv4Network(adapter AdapterView) *net.IPNet {
+	if adapter.PrefixLength < 1 || adapter.PrefixLength > 32 {
+		return nil
+	}
+	ip := net.ParseIP(adapter.Address).To4()
+	if ip == nil {
+		return nil
+	}
+	mask := net.CIDRMask(adapter.PrefixLength, 32)
+	return &net.IPNet{IP: ip.Mask(mask), Mask: mask}
+}
+
+func primaryGateway(value string) string {
+	return strings.TrimSpace(strings.SplitN(value, ",", 2)[0])
+}
+
+func cloneTunPreflight(value TunPreflightSnapshot) TunPreflightSnapshot {
+	value.SelectedAdapterIDs = append([]string(nil), value.SelectedAdapterIDs...)
+	value.SharedGatewayRisks = append([]string(nil), value.SharedGatewayRisks...)
+	value.NetworkRisks = append([]string(nil), value.NetworkRisks...)
+	value.Issues = append([]TunPreflightIssue(nil), value.Issues...)
+	return value
+}
+
+func firstTunBlocker(snapshot TunPreflightSnapshot) error {
+	for _, issue := range snapshot.Issues {
+		if issue.Level == "blocker" {
+			return errors.New(issue.Title + "：" + issue.Detail)
+		}
+	}
+	return nil
+}

@@ -1,0 +1,206 @@
+//go:build windows
+
+package services
+
+import (
+	"context"
+	"encoding/json"
+	"golang.org/x/sys/windows"
+	"net"
+	"os"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+	"unsafe"
+)
+
+func TestIPv6PreferredSourceSkipsTentativeDeprecatedAndExpired(t *testing.T) {
+	var first *windows.IpAdapterUnicastAddress
+	for _, fixture := range []struct {
+		address  string
+		state    int32
+		lifetime uint32
+	}{
+		{"2001:db8::1", windows.IpDadStateDeprecated, 100}, {"2001:db8::2", windows.IpDadStateTentative, 100},
+		{"2001:db8::3", windows.IpDadStatePreferred, 0}, {"fe80::1", windows.IpDadStatePreferred, 100},
+		{"fd00::1", windows.IpDadStatePreferred, 100}, {"2001:db8::5", windows.IpDadStatePreferred, 100},
+	} {
+		raw := new(syscall.RawSockaddrAny)
+		socket := (*windows.RawSockaddrInet6)(unsafe.Pointer(raw))
+		socket.Family = windows.AF_INET6
+		copy(socket.Addr[:], net.ParseIP(fixture.address).To16())
+		first = &windows.IpAdapterUnicastAddress{Next: first, DadState: fixture.state, ValidLifetime: fixture.lifetime, PreferredLifetime: fixture.lifetime, Address: windows.SocketAddress{Sockaddr: raw, SockaddrLength: int32(unsafe.Sizeof(windows.RawSockaddrInet6{}))}}
+	}
+	if got := preferredIPv6Source(first, true); got != "2001:db8::5" {
+		t.Fatalf("preferred=%s", got)
+	}
+	first.Next = nil
+	first.DadState = windows.IpDadStateDeprecated
+	if got := preferredIPv6Source(first, true); got != "" {
+		t.Fatalf("deprecated source=%s", got)
+	}
+}
+
+func TestIPv6PreferredSourceKeepsStableBindingAcrossTemporaryRotation(t *testing.T) {
+	makeAddress := func(ip string, suffix int32, next *windows.IpAdapterUnicastAddress) *windows.IpAdapterUnicastAddress {
+		raw := new(syscall.RawSockaddrAny)
+		socket := (*windows.RawSockaddrInet6)(unsafe.Pointer(raw))
+		socket.Family = windows.AF_INET6
+		copy(socket.Addr[:], net.ParseIP(ip).To16())
+		return &windows.IpAdapterUnicastAddress{Next: next, DadState: windows.IpDadStatePreferred,
+			SuffixOrigin: suffix, ValidLifetime: 100, PreferredLifetime: 100,
+			Address: windows.SocketAddress{Sockaddr: raw, SockaddrLength: int32(unsafe.Sizeof(windows.RawSockaddrInet6{}))}}
+	}
+	for _, temporary := range []string{"2001:db8::1", "2001:db8::2"} {
+		stable := makeAddress("2001:db8::f", windows.IpSuffixOriginLinkLayerAddress, nil)
+		first := makeAddress(temporary, windows.IpSuffixOriginRandom, stable)
+		if got := preferredIPv6Source(first, true); got != "2001:db8::f" {
+			t.Fatalf("temporary rotation changed a usable stable binding: %s", got)
+		}
+		stable.DadState = windows.IpDadStateDeprecated
+		if got := preferredIPv6Source(first, true); got != temporary {
+			t.Fatalf("temporary fallback unavailable after stable address was deprecated: %s", got)
+		}
+	}
+	private := makeAddress("fd00::1", windows.IpSuffixOriginLinkLayerAddress, nil)
+	public := makeAddress("2001:db8::1", windows.IpSuffixOriginRandom, private)
+	if got := preferredIPv6Source(public, true); got != "2001:db8::1" {
+		t.Fatalf("stable ULA displaced usable public IPv6: %s", got)
+	}
+}
+
+func TestIPv6PreferredSourceIgnoresULAWithoutIPv6Gateway(t *testing.T) {
+	makeAddress := func(ip string, next *windows.IpAdapterUnicastAddress) *windows.IpAdapterUnicastAddress {
+		raw := new(syscall.RawSockaddrAny)
+		socket := (*windows.RawSockaddrInet6)(unsafe.Pointer(raw))
+		socket.Family = windows.AF_INET6
+		copy(socket.Addr[:], net.ParseIP(ip).To16())
+		return &windows.IpAdapterUnicastAddress{Next: next, DadState: windows.IpDadStatePreferred,
+			SuffixOrigin: windows.IpSuffixOriginLinkLayerAddress, ValidLifetime: 100, PreferredLifetime: 100,
+			Address: windows.SocketAddress{Sockaddr: raw, SockaddrLength: int32(unsafe.Sizeof(windows.RawSockaddrInet6{}))}}
+	}
+	ula := makeAddress("fd07:64c3:380b:0:6:adcd:64df:499f", nil)
+	if got := preferredIPv6Source(ula, false); got != "" {
+		t.Fatalf("ULA-only link without an IPv6 gateway was treated as IPv6 egress: %s", got)
+	}
+	if got := preferredIPv6Source(ula, true); got != "fd07:64c3:380b:0:6:adcd:64df:499f" {
+		t.Fatalf("ULA behind an IPv6 gateway (NAT66) must remain usable: %s", got)
+	}
+	public := makeAddress("2001:db8::1", makeAddress("fd00::1", nil))
+	if got := preferredIPv6Source(public, false); got != "2001:db8::1" {
+		t.Fatalf("global IPv6 must not depend on gateway discovery: %s", got)
+	}
+}
+
+func TestIPv6OnlyGeneratedTUNConfigsPassBundledCheck(t *testing.T) {
+	t.Setenv("HIMIX_DATA_DIR", t.TempDir())
+	endpoints := map[string]string{"nic_ethernet": "127.0.0.1:19101", "nic_wifi": "127.0.0.1:19102", "aggregation": "127.0.0.1:19103"}
+	adapter := AdapterView{Name: "v6", SourceIPv6: "2001:db8::1", IPv6IfIndex: 7}
+	for _, policy := range []string{"auto", "off", "system", "google", "dnspod"} {
+		t.Run(policy, func(t *testing.T) {
+			dnsResult := dnsResolveResult{Transport: "udp", Server: "[2001:db8::53]:53"}
+			if policy == "google" || policy == "dnspod" {
+				dnsResult.Transport = "doh"
+				dnsResult.Server = "dns.google@[2001:4860:4860::8888]:443"
+				if policy == "dnspod" {
+					dnsResult.Server = "doh.pub@[2001:db8::53]:443"
+				}
+			}
+			executable, path, _, err := writeSingBoxConfigWithOptions(endpoints, adapter, dnsResult, nil, compatibilityPlan{}, true, tunConfigOptions{DNSPolicy: policy, IPv6Available: true, IPv4Unavailable: true, ConfigName: policy + ".json"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var cfg struct {
+				Route struct {
+					Rules []map[string]any `json:"rules"`
+				} `json:"route"`
+			}
+			if err = json.Unmarshal(data, &cfg); err != nil {
+				t.Fatal(err)
+			}
+			if policy != "system" {
+				found := false
+				for _, rule := range cfg.Route.Rules {
+					if rule["action"] == "resolve" {
+						found = true
+						if rule["strategy"] != "prefer_ipv6" {
+							t.Fatal("IPv6-only TUN preferred IPv4")
+						}
+					}
+				}
+				if !found {
+					t.Fatal("missing domain resolution")
+				}
+			}
+			checkSingBoxConfig(t, executable, path)
+		})
+	}
+}
+
+func TestDesktopIPv6ICMPRealLoopback(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3e9)
+	defer cancel()
+	result := probeICMPv6(ctx, "::1", "::1")
+	if result.Sent == 0 || result.Received != result.Sent {
+		t.Fatalf("IPv6 ICMP=%+v", result)
+	}
+}
+
+func TestDesktopIPv6ICMPReportsNativeErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		createFails bool
+		want        string
+	}{
+		{"create", true, "Icmp6CreateFile failed:"},
+		{"send", false, "Icmp6SendEcho2 failed:"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			closed, sent := false, 0
+			create := func(...uintptr) (uintptr, uintptr, error) {
+				if tc.createFails {
+					return ^uintptr(0), 0, syscall.Errno(5)
+				}
+				return 1, 0, nil
+			}
+			send := func(uintptr, *windows.RawSockaddrInet6, *windows.RawSockaddrInet6, []byte, []byte, time.Duration) (uintptr, error) {
+				sent++
+				return 0, syscall.Errno(11050)
+			}
+			closeHandle := func(...uintptr) (uintptr, uintptr, error) { closed = true; return 1, 0, nil }
+			result := probeICMPv6WithAPI(context.Background(), "::1", "::1", create, send, closeHandle)
+			if result.Status != "unavailable" || !strings.HasPrefix(result.Note, tc.want) || result.Received != 0 {
+				t.Fatalf("native failure was lost: %+v", result)
+			}
+			if tc.createFails {
+				if closed || sent != 0 || result.Sent != 0 {
+					t.Fatal("used an invalid ICMP handle")
+				}
+			} else if !closed || sent != diagnosticProbeCount || result.Sent != sent || result.LossRate != -1 {
+				t.Fatal("failed sends lost accounting or leaked the handle")
+			}
+		})
+	}
+}
+
+func TestReadOnlyWindowsDefaultDNSEgress(t *testing.T) {
+	if os.Getenv("HIMIX_RUN_TUN_PREFLIGHT_TEST") != "1" {
+		t.Skip("set HIMIX_RUN_TUN_PREFLIGHT_TEST=1 for read-only native default-route inspection")
+	}
+	name, err := systemDefaultDNSAdapterID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := net.InterfaceByName(name); err != nil {
+		t.Fatalf("default route alias does not map to a real adapter: %s %v", name, err)
+	}
+	if isHimixManagedAdapter(name) {
+		t.Fatal("own TUN became default DNS egress")
+	}
+	t.Logf("native default DNS egress: %s", name)
+}

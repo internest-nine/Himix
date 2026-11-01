@@ -1,0 +1,428 @@
+import * as AdapterService from "../../bindings/github.com/internest-nine/Himix/desktop/internal/services/adapterservice";
+import * as DiagnosticsService from "../../bindings/github.com/internest-nine/Himix/desktop/internal/services/diagnosticsservice";
+import * as EngineService from "../../bindings/github.com/internest-nine/Himix/desktop/internal/services/engineservice";
+import * as RoutingRuleService from "../../bindings/github.com/internest-nine/Himix/desktop/internal/services/routingruleservice";
+import * as SettingsService from "../../bindings/github.com/internest-nine/Himix/desktop/internal/services/settingsservice";
+import * as TunService from "../../bindings/github.com/internest-nine/Himix/desktop/internal/services/tunservice";
+import * as UpdaterService from "../../bindings/github.com/internest-nine/Himix/desktop/internal/services/updaterservice";
+import { Call } from "@wailsio/runtime";
+import type {
+  AppSettings,
+  AdapterView as GeneratedAdapterView,
+  DiagnosticResult,
+  DiagnosticSnapshot,
+  EngineSnapshot as GeneratedEngineSnapshot,
+  LinkFailoverState,
+  RunningProcess,
+  RoutingBatchPreview,
+  RoutingRule,
+  RoutingSnapshot as GeneratedRoutingSnapshot,
+  RoutingValidation,
+  SupportLogSession,
+  SupportLogSnapshot,
+  TunPreflightIssue,
+  TunPreflightSnapshot,
+} from "../../bindings/github.com/internest-nine/Himix/desktop/internal/services/models";
+
+export type {
+  DiagnosticResult,
+  DiagnosticSnapshot,
+  LinkFailoverState,
+  RunningProcess,
+  RoutingBatchPreview,
+  RoutingRule,
+  RoutingValidation,
+  SupportLogSession,
+  SupportLogSnapshot,
+  TunPreflightIssue,
+  TunPreflightSnapshot,
+};
+
+export type MTUInfo = { adapter_id: string; guid: string; if_index: number; address: string; current: number; original?: number };
+export type MTUResult = MTUInfo & { target: string; recommended: number; at_limit: boolean; tested_at: string };
+
+// One subscribed domain-category list (issue #62): a whole category routed to a
+// single outbound instead of typing its domains one by one.
+export type RuleSetEntries = { entries: { kind: string; value: string }[]; total: number; downloaded: boolean };
+
+export type RuleSet = {
+  id: string;
+  name: string;
+  url: string;
+  outbound: string;
+  priority?: number;
+  disabled?: boolean;
+  updated_at?: number;
+  etag?: string;
+  last_modified?: string;
+  content_sha256?: string;
+  format?: string;
+  entry_count?: number;
+  ignored_count?: number;
+  last_error?: string;
+};
+
+export type FamilyRuntimeHealth = { state: string; successes: number; failures: number; consecutive_failures: number };
+export type EngineSnapshot = Omit<GeneratedEngineSnapshot, "adapters"> & { strategy?: string; ipv4_only_fallback?: boolean; adapters: Array<NonNullable<GeneratedEngineSnapshot["adapters"]>[number] & { ipv4_health?: FamilyRuntimeHealth; ipv6_health?: FamilyRuntimeHealth }> | null };
+
+export type RoutingSnapshot = Omit<GeneratedRoutingSnapshot, "match_order" | "revision"> & { match_order?: string[] | null; revision?: string };
+
+export type RouteProbeHop = {
+	adapter_id: string;
+	adapter_name: string;
+	kind: string;
+	source_address: string;
+	target: string;
+	ok: boolean;
+	latency_ms: number;
+	detail?: string;
+};
+
+export type RouteProbeReport = {
+	value: string;
+	host: string;
+	addresses: string[] | null;
+	ports: number[] | null;
+	hops: RouteProbeHop[] | null;
+	recommended_adapter_id?: string;
+	recommended_name?: string;
+	all_failed: boolean;
+};
+
+export type AdapterView = GeneratedAdapterView & { is_virtual?: boolean; ipv6_gateway?: string; ipv6_metric?: number; ipv6_automatic_metric?: boolean };
+
+export type CompleteAppSettings = Omit<AppSettings, "ai_enabled" | "default_outbound" | "dns_servers" | "doh_servers" | "dot_servers"> & {
+	// Optional for settings written before configurable resolver lists.
+	dns_servers?: string[];
+	doh_servers?: string[];
+	dot_servers?: string[];
+  ai_enabled?: boolean;
+  default_outbound?: string;
+  update_channel?: "stable" | "preview";
+  strategy?: string;
+  steam_cdn_enabled?: boolean;
+  hide_virtual_adapters?: boolean;
+  tun_stack: string;
+  language: "zh" | "en";
+  force_tun_connectivity_bypass: boolean;
+  blocked_domain_bypass: boolean;
+  blocked_domain_expiry: boolean;
+  autostart: boolean;
+  auto_start_engine: boolean;
+  auto_connect_wifi?: boolean;
+};
+
+export type SteamCDNStatus = {
+ runtime_state?: "offline" | "unsupported" | "stopped" | "disabled" | "running";
+ speed_probe_bytes?: number; speed_probe_limit?: number;
+ core_version?: string; core_commit?: string; configured_mode?: string;
+ accounting_version?: number; started_at?: string; sampled_at?: string; switched_bytes?: number; original_bytes?: number; transfer_failures?: number;
+ stage_counts?: Record<string,number>; effective_replacements?: number;
+ recognized?: number;
+ diagnostics?: Array<{domain: string; adapter: string; ip: string; stage: string; at: string}>;
+ available: boolean; enabled: boolean; probing: number; replacements: number; fallbacks: number;
+ entries: Array<{probe_bps?: number; probed_at?: string; admission_reason?: string; source?: string; evaluated_at?: string; switched_bytes?: number; original_bytes?: number; switched_bps?: number; switched_active?: number; transfer_failures?: number; decision_reason?: string; validated?: boolean; preferred?: boolean; total_bps?: number; active_connections?: number; successful_connections?: number; effective_bytes?: number; adapter: string; domain: string; port: string; ip: string; download_bps: number; samples: number; selections: number; cooldown_until: string; expires_at: string}>;
+};
+
+export type HotspotConfig = { ssid: string; password: string; band: "auto" | "2.4" | "5"; adapter_id?: string };
+export type HotspotAdapter = { id: string; name: string; description: string; status: string; upstream: boolean };
+export type HotspotStatus = {
+  session_id?: string;
+  hotspot_adapter?: string;
+  hotspot_adapter_id?: string;
+  configured_band?: string; band_fallback?: string;
+  transmit_link_mbps?: number; receive_link_mbps?: number;
+  devices?: Array<{ mac: string; hosts: string[] }>;
+  devices_available?: boolean; updated_at?: string;
+  idle_timeout?: string; stop_reason?: string;
+  state: "stopped" | "starting" | "running" | "stopping" | "failed";
+  ssid: string; band: string; clients: number; shared_adapter: string;
+  sharing_verified: boolean; cleanup_complete?: boolean; hotspot_off_confirmed?: boolean; configuration_restored?: boolean; cleanup_error?: string; ready: boolean; message?: string; diagnostics?: string; gateway_address?: string;
+};
+
+export type BlockedDomainEntry = {
+  adapter: string;
+  domain: string;
+  expires_at: string;
+  remaining_seconds: number;
+  permanent: boolean;
+};
+
+export type BlockedDomainSnapshot = {
+  enabled: boolean;
+  use_expiry: boolean;
+  entries: BlockedDomainEntry[];
+};
+
+export type ReleaseInfo = {
+  tag_name: string;
+  name: string;
+  notes: string;
+  page_url: string;
+  installer_urls: string[];
+  installer_name: string;
+  installer_size: number;
+  installer_digest: string;
+};
+
+export type UpdateCheckResult = {
+  current_version: string;
+  available: boolean;
+  release: ReleaseInfo;
+};
+
+export type UpdateProgress = {
+  state: "idle" | "starting" | "downloading" | "verifying" | "ready" | "installing" | "failed";
+  downloaded: number;
+  total: number;
+  message?: string;
+};
+
+export type WFPRepairResult = {
+  elevated: boolean;
+  bfe_running: boolean;
+  engine_ready: boolean;
+  repair_attempted: boolean;
+  repaired: boolean;
+  detail?: string;
+};
+
+export type ConnectionView = {
+  id: number;
+  process?: string;
+  protocol: string;
+  client?: string;
+  target?: string;
+  domain?: string;
+  remote_ip?: string;
+  remote_port?: string;
+  adapter?: string;
+  outbound: string;
+  outbound_detail?: string;
+  started_at: string;
+  bytes_up: number;
+  bytes_down: number;
+};
+
+export type ConnectionListSnapshot = {
+  phase: string;
+  mode: string;
+  sampled_at: string;
+  connections: ConnectionView[];
+};
+
+export type ConfigMigrationStatus = {
+  legacy_found: boolean;
+  applied: boolean;
+  legacy_path: string;
+  backup_path?: string;
+  message: string;
+};
+
+export type NATDetectionResult = {
+  state: "idle" | "running" | "completed" | "inconclusive" | "cancelled";
+  adapter_id?: string;
+  name?: string;
+  address?: string;
+  nat_type?: "direct" | "full_cone" | "restricted_cone" | "port_restricted_cone" | "symmetric" | "unknown" | "inconclusive";
+  mapping_behavior?: "direct" | "endpoint_independent" | "address_dependent" | "address_port_dependent" | "inconclusive";
+  filtering_behavior?: "direct" | "endpoint_independent" | "address_dependent" | "address_port_dependent" | "inconclusive";
+  public_endpoint?: string;
+  server?: string;
+  detail?: string;
+  host_firewall_limited?: boolean;
+  attempts?: NATProbeAttempt[];
+  duration_ms?: number;
+  started_at?: string;
+  completed_at?: string;
+};
+
+export type NATFirewallState = {
+  supported: boolean;
+  enabled: boolean;
+  allowed: boolean;
+  detail?: string;
+};
+
+export type NATProbeAttempt = {
+  server: string;
+  resolved?: string;
+  code: "success" | "timeout" | "unsupported" | "fake_ip" | "resolve_failed" | "invalid_response" | "network_error" | "host_firewall";
+  detail: string;
+  duration_ms: number;
+};
+
+export type NATServer = {
+  id: string;
+  name: string;
+  address: string;
+  built_in: boolean;
+};
+
+export type NATServerSnapshot = {
+  selected_id: string;
+  servers: NATServer[];
+};
+
+const settingsMethod = (method: string) =>
+  `github.com/internest-nine/Himix/desktop/internal/services.SettingsService.${method}`;
+const blockedDomainMethod = (method: string) =>
+  `github.com/internest-nine/Himix/desktop/internal/services.BlockedDomainService.${method}`;
+const engineMethod = (method: string) =>
+  `github.com/internest-nine/Himix/desktop/internal/services.EngineService.${method}`;
+const appearanceMethod = (method: string) =>
+  `github.com/internest-nine/Himix/desktop/internal/services.AppearanceService.${method}`;
+const diagnosticsMethod = (method: string) =>
+  `github.com/internest-nine/Himix/desktop/internal/services.DiagnosticsService.${method}`;
+const ruleSetMethod = (method: string) =>
+  `github.com/internest-nine/Himix/desktop/internal/services.RuleSetService.${method}`;
+
+export async function withServiceTimeout<T>(
+  request: Promise<T>,
+  timeoutMs: number,
+  operation: string,
+): Promise<T> {
+  let timer: number | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = window.setTimeout(() => {
+      reject(new Error(`${operation} (${Math.ceil(timeoutMs / 1000)}s)`));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([request, timeout]);
+  } finally {
+    if (timer !== undefined) window.clearTimeout(timer);
+  }
+}
+
+// Pages never import generated Wails bindings directly. This facade keeps the
+// desktop transport replaceable and gives browser-only visual QA an explicit,
+// visibly disconnected fixture rather than pretending a real core is running.
+export const appServices = {
+  adapters: {
+    list: () => AdapterService.List(),
+    refresh: () => AdapterService.Refresh(),
+    save: (mode: string, weighted: boolean, adapters: AdapterView[], strategy?: string) =>
+      strategy ? EngineService.SaveScheduling(mode, strategy, adapters) : AdapterService.SaveSelection(mode, weighted, adapters),
+    saveSelected: (ids: string[]) => Call.ByName(engineMethod("SaveDiagnosticSelection"), ids) as Promise<AdapterView[]>,
+  },
+  engine: {
+    hotspotAdapters: () => Call.ByName(engineMethod("HotspotAdapters")) as Promise<HotspotAdapter[]>,
+    trayStatus: () => Call.ByName(engineMethod("TrayStatus")) as Promise<{ phase: string; mode: string }>,
+    saveHotspotPreferences: (config: HotspotConfig) => Call.ByName(engineMethod("SaveHotspotPreferences"), config) as Promise<void>,
+    hotspotPreferences: () => Call.ByName(engineMethod("HotspotPreferences")) as Promise<HotspotConfig>,
+    hotspotSessionConfig: (sessionID: string) => Call.ByName(engineMethod("HotspotSessionConfig"), sessionID) as Promise<HotspotConfig>,
+    hotspotStatus: () => Call.ByName(engineMethod("HotspotStatus")) as Promise<HotspotStatus>,
+    startHotspot: (config: HotspotConfig) => Call.ByName(engineMethod("StartHotspot"), config) as Promise<HotspotStatus>,
+    stopHotspot: () => Call.ByName(engineMethod("StopHotspot")) as Promise<HotspotStatus>,
+    steamCDNStatus: (reset = false) => Call.ByName(engineMethod("SteamCDNStatus"), reset) as Promise<SteamCDNStatus>,
+    setSteamCDNEnabled: (enabled: boolean) => Call.ByName(engineMethod("SetSteamCDNEnabled"), enabled) as Promise<CompleteAppSettings>,
+    snapshot: () => EngineService.Snapshot(),
+    connections: () =>
+      Call.ByName(engineMethod("Connections")) as Promise<ConnectionListSnapshot>,
+    start: (mode: string) => EngineService.Start(mode),
+    stop: () => EngineService.Stop(),
+    repairWfp: () =>
+      Call.ByName(
+        "github.com/internest-nine/Himix/desktop/internal/services.EngineService.RepairWFP",
+      ) as Promise<WFPRepairResult>,
+  },
+  routing: {
+    snapshot: () => RoutingRuleService.Snapshot() as Promise<RoutingSnapshot>,    validate: (rule: RoutingRule, existing: RoutingRule[]) =>
+      RoutingRuleService.Validate(rule, existing),
+    previewBatch: (matchType: string, values: string[], outbound: string, existing: RoutingRule[]) =>
+      RoutingRuleService.PreviewBatch(matchType, values, outbound, existing),
+    save: (rules: RoutingRule[], order: string[] = ["process", "domain", "ip"], revision?: string) => (revision === undefined
+      ? Call.ByName("github.com/internest-nine/Himix/desktop/internal/services.RoutingRuleService.SaveOrdered", rules, order)
+      : Call.ByName("github.com/internest-nine/Himix/desktop/internal/services.RoutingRuleService.SaveOrderedChecked", rules, order, revision)) as Promise<RoutingSnapshot>,
+    listProcesses: () => RoutingRuleService.ListProcesses(),
+    listProcessChoices: () => RoutingRuleService.ListProcessChoices(),
+    importRules: () => RoutingRuleService.Import(),
+    exportRules: (rules: RoutingRule[], order: string[] = ["process", "domain", "ip"]) => Call.ByName("github.com/internest-nine/Himix/desktop/internal/services.RoutingRuleService.ExportOrdered", rules, order) as Promise<string>,
+  },
+  routeProbe: {
+    // Which adapter can actually reach this target? Advisory only: the native
+    // side pins each attempt to one adapter, so nothing is applied to the system.
+    probe: (value: string) =>
+      Call.ByName(
+        "github.com/internest-nine/Himix/desktop/internal/services.RouteProbeService.Probe",
+        value,
+      ) as Promise<RouteProbeReport>,
+  },
+  mtu: {
+    current: (id: string) => Call.ByName("github.com/internest-nine/Himix/desktop/internal/services.MTUService.Current", id) as Promise<MTUInfo>,
+    detect: (id: string, target: string) => Call.ByName("github.com/internest-nine/Himix/desktop/internal/services.MTUService.Detect", id, target) as Promise<MTUResult>,
+    cancel: () => Call.ByName("github.com/internest-nine/Himix/desktop/internal/services.MTUService.Cancel") as Promise<void>,
+    apply: (id: string) => Call.ByName("github.com/internest-nine/Himix/desktop/internal/services.MTUService.Apply", id) as Promise<MTUInfo>,
+    restore: (id: string) => Call.ByName("github.com/internest-nine/Himix/desktop/internal/services.MTUService.Restore", id) as Promise<MTUInfo>,
+  },
+  diagnostics: {
+    latest: () => DiagnosticsService.Latest(),
+    run: (adapterIDs: string[]) => DiagnosticsService.Run(adapterIDs),
+    cancel: () => DiagnosticsService.Cancel(),
+    logs: () => DiagnosticsService.Logs(),
+    exportLogs: () => DiagnosticsService.ExportLogs(),
+    openLogDirectory: () => DiagnosticsService.OpenLogDirectory(),
+    natLatest: () => Call.ByName(diagnosticsMethod("NATLatest")) as Promise<NATDetectionResult>,
+    runNAT: (adapterID: string, serverID: string) =>
+      Call.ByName(diagnosticsMethod("RunNAT"), adapterID, serverID) as Promise<NATDetectionResult>,
+    cancelNAT: () => Call.ByName(diagnosticsMethod("CancelNAT")) as Promise<NATDetectionResult>,
+    natServers: () => Call.ByName(diagnosticsMethod("NATServers")) as Promise<NATServerSnapshot>,
+    selectNATServer: (id: string) =>
+      Call.ByName(diagnosticsMethod("SelectNATServer"), id) as Promise<NATServerSnapshot>,
+    addNATServer: (name: string, address: string) =>
+      Call.ByName(diagnosticsMethod("AddNATServer"), name, address) as Promise<NATServerSnapshot>,
+    removeNATServer: (id: string) =>
+      Call.ByName(diagnosticsMethod("RemoveNATServer"), id) as Promise<NATServerSnapshot>,
+      resetNATServers: () => Call.ByName(diagnosticsMethod("ResetNATServers")) as Promise<NATServerSnapshot>,
+      natFirewallState: () => Call.ByName(diagnosticsMethod("NATFirewallState")) as Promise<NATFirewallState>,
+      allowNATFirewallTraffic: () =>
+        Call.ByName(diagnosticsMethod("AllowNATFirewallTraffic")) as Promise<NATFirewallState>,
+  },
+  tun: {
+    latest: () => TunService.Latest(),
+    preflight: (adapterIDs: string[]) => TunService.Preflight(adapterIDs),
+  },
+  settings: {
+    get: async () => (await SettingsService.Get()) as CompleteAppSettings,
+    update: (settings: CompleteAppSettings, fields: string[]) =>
+      Call.ByName(settingsMethod("UpdateFields"), settings, fields) as Promise<CompleteAppSettings>,
+    setAutostart: (enabled: boolean) =>
+      Call.ByName(settingsMethod("SetAutostart"), enabled) as Promise<CompleteAppSettings>,
+    setAutoStartEngine: (enabled: boolean) =>
+      Call.ByName(settingsMethod("SetAutoStartEngine"), enabled) as Promise<CompleteAppSettings>,
+    configPath: () => Call.ByName(settingsMethod("ConfigPath")) as Promise<string>,
+    migrationStatus: () =>
+      Call.ByName(settingsMethod("MigrationStatus")) as Promise<ConfigMigrationStatus>,
+    migrateLegacy: () =>
+      Call.ByName(settingsMethod("MigrateLegacy")) as Promise<CompleteAppSettings>,
+    rollbackLegacy: () =>
+      Call.ByName(settingsMethod("RollbackLegacyMigration")) as Promise<CompleteAppSettings>,
+  },
+  appearance: {
+    load: () => Call.ByName(appearanceMethod("Load")) as Promise<string>,
+    save: (payload: string) => Call.ByName(appearanceMethod("Save"), payload) as Promise<string>,
+  },
+  blockedDomains: {
+    list: () => Call.ByName(blockedDomainMethod("List")) as Promise<BlockedDomainSnapshot>,
+    remove: (adapter: string, domain: string) =>
+      Call.ByName(blockedDomainMethod("Remove"), adapter, domain) as Promise<void>,
+    clear: () => Call.ByName(blockedDomainMethod("Clear")) as Promise<void>,
+  },
+  ruleSets: {
+    entries: (id: string, query: string, offset: number, limit: number) =>
+      Call.ByName(ruleSetMethod("Entries"), id, query, offset, limit) as Promise<RuleSetEntries>,
+    list: () => Call.ByName(ruleSetMethod("List")) as Promise<RuleSet[]>,
+    save: (sets: RuleSet[]) => Call.ByName(ruleSetMethod("Save"), sets) as Promise<RuleSet[]>,
+    update: (id: string) => Call.ByName(ruleSetMethod("Update"), id) as Promise<RuleSet[]>,
+  },
+  // Update checks only happen when the user asks for one. There is no startup
+  // check and no timer: the app stays offline until this is called.
+  updater: {
+    check: () => UpdaterService.Check() as Promise<UpdateCheckResult>,
+    download: (release: ReleaseInfo) => UpdaterService.Download(release) as Promise<string>,
+    installAndQuit: (installerPath: string) =>
+      UpdaterService.InstallAndQuit(installerPath) as Promise<void>,
+    progress: () => UpdaterService.Progress() as Promise<UpdateProgress>,
+  },
+};

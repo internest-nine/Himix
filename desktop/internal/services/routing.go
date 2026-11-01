@@ -1,0 +1,740 @@
+package services
+
+import (
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/internest-nine/Himix/desktop/internal/platform"
+	"golang.org/x/net/idna"
+)
+
+const (
+	MatchProcess   = "process"
+	MatchDomain    = "domain"
+	MatchIP        = "ip"
+	OutboundReject = "reject"
+	// OutboundAggregation is also the landing spot for rules whose adapter is
+	// temporarily gone. See linkfailover.go.
+	OutboundAggregation = "aggregation"
+
+	RoutingBatchMaxValues = 2000
+
+	RoutingBatchAdd       = "add"
+	RoutingBatchDuplicate = "duplicate"
+	RoutingBatchConflict  = "conflict"
+	RoutingBatchInvalid   = "invalid"
+
+	RoutingBackupFormat  = "himix-routing-rules"
+	RoutingBackupVersion = 3
+)
+
+type RoutingRule struct {
+	Disabled  bool   `json:"disabled,omitempty"`
+	Priority  int    `json:"priority,omitempty"`
+	MatchType string `json:"match_type"`
+	Value     string `json:"value"`
+	Outbound  string `json:"outbound"`
+}
+
+// RunningProcess is a process choice shown by the routing rule picker. Icon is
+// an optional PNG data URL; an empty value tells the frontend to use the shared
+// fallback icon for inaccessible executables and Windows' generic app icon.
+type RunningProcess struct {
+	Name string `json:"name"`
+	Icon string `json:"icon,omitempty"`
+}
+
+func (r *RoutingRule) UnmarshalJSON(data []byte) error {
+	rules, err := expandRoutingRule(data)
+	if err != nil {
+		return err
+	}
+	if len(rules) != 1 {
+		return fmt.Errorf("一条 JSON 规则包含 %d 个匹配值；请通过旧版规则迁移器展开", len(rules))
+	}
+	*r = rules[0]
+	return nil
+}
+
+func expandRoutingRule(data []byte) ([]RoutingRule, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	var disabled bool
+	var priority int
+	if payload := raw["disabled"]; payload != nil {
+		if err := json.Unmarshal(payload, &disabled); err != nil {
+			return nil, fmt.Errorf("规则 disabled 必须是布尔值")
+		}
+	}
+	if payload := raw["priority"]; payload != nil {
+		if err := json.Unmarshal(payload, &priority); err != nil {
+			return nil, fmt.Errorf("规则 priority 必须是整数")
+		}
+	}
+	var matchType, outbound string
+	_ = json.Unmarshal(raw["match_type"], &matchType)
+	_ = json.Unmarshal(raw["outbound"], &outbound)
+	if matchType == "" {
+		present := []string{}
+		if raw["process_name"] != nil {
+			present = append(present, MatchProcess)
+		}
+		if raw["domain"] != nil || raw["domain_suffix"] != nil {
+			present = append(present, MatchDomain)
+		}
+		if raw["ip_cidr"] != nil || raw["ip"] != nil {
+			present = append(present, MatchIP)
+		}
+		if len(present) != 1 {
+			return nil, fmt.Errorf("旧版规则必须且只能包含一种匹配类型")
+		}
+		matchType = present[0]
+	}
+	matchType = canonicalMatchType(matchType)
+	values := []string{}
+	if payload := raw["value"]; payload != nil {
+		var value string
+		if err := json.Unmarshal(payload, &value); err != nil {
+			return nil, fmt.Errorf("规则 value 必须是字符串")
+		}
+		values = append(values, value)
+	} else {
+		fields := map[string][]string{
+			MatchProcess: {"process_name"},
+			MatchDomain:  {"domain", "domain_suffix"},
+			MatchIP:      {"ip_cidr", "ip"},
+		}[matchType]
+		for _, field := range fields {
+			payload := raw[field]
+			if payload == nil {
+				continue
+			}
+			var many []string
+			if err := json.Unmarshal(payload, &many); err == nil {
+				values = append(values, many...)
+				continue
+			}
+			var one string
+			if err := json.Unmarshal(payload, &one); err != nil {
+				return nil, fmt.Errorf("规则字段 %s 必须是字符串或字符串数组", field)
+			}
+			values = append(values, one)
+		}
+	}
+	if len(values) == 0 {
+		return nil, fmt.Errorf("规则没有匹配值")
+	}
+	rules := make([]RoutingRule, 0, len(values))
+	for _, value := range values {
+		rules = append(rules, RoutingRule{
+			Disabled: disabled, Priority: priority,
+			MatchType: matchType,
+			Value:     value,
+			Outbound:  strings.TrimSpace(outbound),
+		})
+	}
+	return rules, nil
+}
+
+type RoutingValidation struct {
+	Valid     bool        `json:"valid"`
+	Rule      RoutingRule `json:"rule"`
+	Message   string      `json:"message,omitempty"`
+	Duplicate bool        `json:"duplicate"`
+}
+
+type RoutingBatchItem struct {
+	Input            string      `json:"input"`
+	Status           string      `json:"status"`
+	Rule             RoutingRule `json:"rule"`
+	Message          string      `json:"message,omitempty"`
+	ExistingOutbound string      `json:"existing_outbound,omitempty"`
+}
+
+type RoutingBatchPreview struct {
+	Items          []RoutingBatchItem `json:"items"`
+	AddCount       int                `json:"add_count"`
+	DuplicateCount int                `json:"duplicate_count"`
+	ConflictCount  int                `json:"conflict_count"`
+	InvalidCount   int                `json:"invalid_count"`
+}
+
+type RoutingSnapshot struct {
+	Revision        string        `json:"revision"`
+	MatchOrder      []string      `json:"match_order"`
+	Rules           []RoutingRule `json:"rules"`
+	Outbounds       []Outbound    `json:"outbounds"`
+	RestartRequired bool          `json:"restart_required"`
+	RestartReason   string        `json:"restart_reason,omitempty"`
+}
+
+type Outbound struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+}
+
+type RoutingRuleService struct {
+	settings *SettingsService
+	adapters *AdapterService
+	desktop  platform.DesktopHost
+}
+
+func NewRoutingRuleService(settings *SettingsService, adapters *AdapterService, desktop platform.DesktopHost) *RoutingRuleService {
+	return &RoutingRuleService{settings: settings, adapters: adapters, desktop: desktop}
+}
+
+func (s *RoutingRuleService) Snapshot() (RoutingSnapshot, error) {
+	settings := s.settings.Get()
+	rules, err := normalizeRules(settings.RoutingRules)
+	if err != nil {
+		return RoutingSnapshot{}, err
+	}
+	outbounds, err := s.availableOutbounds()
+	if err != nil {
+		return RoutingSnapshot{}, err
+	}
+	restartRequired, restartReason := singBoxRuleSetRestartRequirement(rules, settings.RuleSets)
+	return RoutingSnapshot{
+		Revision: routingRevision(settings),
+		Rules:    rules, Outbounds: outbounds, MatchOrder: routingMatchOrder(settings),
+		RestartRequired: restartRequired, RestartReason: restartReason,
+	}, nil
+}
+
+func (s *RoutingRuleService) availableOutbounds() ([]Outbound, error) {
+	outbounds := []Outbound{
+		{ID: "aggregation", Label: "多网卡聚合"},
+		{ID: "direct", Label: "直连 / 绕过"},
+		{ID: OutboundReject, Label: "拒绝连接"},
+	}
+	adapters, listErr := s.adapters.List()
+	if listErr != nil {
+		return nil, fmt.Errorf("读取可用网卡失败：%w", listErr)
+	}
+	for _, adapter := range adapters {
+		if !adapter.Selected || !adapter.Operational {
+			continue
+		}
+		outbounds = append(outbounds, Outbound{ID: "nic_" + adapter.ID, Label: adapter.Name})
+	}
+	return outbounds, nil
+}
+
+func (s *RoutingRuleService) Validate(rule RoutingRule, existing []RoutingRule) RoutingValidation {
+	normalized, err := normalizeRule(rule)
+	if err != nil {
+		return RoutingValidation{Valid: false, Rule: rule, Message: err.Error()}
+	}
+	if err := s.validateSelectedOutbounds([]RoutingRule{normalized}); err != nil {
+		return RoutingValidation{Valid: false, Rule: normalized, Message: err.Error()}
+	}
+	identity := ruleIdentity(normalized)
+	for _, candidate := range existing {
+		value, candidateErr := normalizeRule(candidate)
+		if candidateErr == nil && ruleIdentity(value) == identity {
+			return RoutingValidation{
+				Valid: false, Rule: normalized, Duplicate: true,
+				Message: "相同类型和匹配值的规则已存在",
+			}
+		}
+	}
+	return RoutingValidation{Valid: true, Rule: normalized}
+}
+
+func (s *RoutingRuleService) PreviewBatch(
+	matchType string,
+	values []string,
+	outbound string,
+	existing []RoutingRule,
+) (RoutingBatchPreview, error) {
+	if len(values) == 0 {
+		return RoutingBatchPreview{}, fmt.Errorf("批量输入不能为空")
+	}
+	if len(values) > RoutingBatchMaxValues {
+		return RoutingBatchPreview{}, fmt.Errorf("单次最多预检 %d 条规则", RoutingBatchMaxValues)
+	}
+	outbound = strings.TrimSpace(outbound)
+	if !isValidOutbound(outbound) {
+		return RoutingBatchPreview{}, fmt.Errorf("未知出口通道")
+	}
+	if err := s.validateSelectedOutbounds([]RoutingRule{{Outbound: outbound}}); err != nil {
+		return RoutingBatchPreview{}, err
+	}
+
+	existingByIdentity := make(map[string]RoutingRule, len(existing))
+	for _, raw := range existing {
+		rule, err := normalizeRule(raw)
+		if err == nil {
+			existingByIdentity[ruleIdentity(rule)] = rule
+		}
+	}
+	preview := RoutingBatchPreview{Items: make([]RoutingBatchItem, 0, len(values))}
+	seenBatch := make(map[string]struct{}, len(values))
+	for _, input := range values {
+		rule, err := normalizeRule(RoutingRule{
+			MatchType: matchType,
+			Value:     input,
+			Outbound:  outbound,
+		})
+		item := RoutingBatchItem{Input: input, Rule: rule}
+		if err != nil {
+			item.Status = RoutingBatchInvalid
+			item.Message = err.Error()
+			preview.InvalidCount++
+			preview.Items = append(preview.Items, item)
+			continue
+		}
+		identity := ruleIdentity(rule)
+		if _, duplicate := seenBatch[identity]; duplicate {
+			item.Status = RoutingBatchDuplicate
+			item.Message = "批量输入中存在重复项"
+			preview.DuplicateCount++
+			preview.Items = append(preview.Items, item)
+			continue
+		}
+		seenBatch[identity] = struct{}{}
+		if current, exists := existingByIdentity[identity]; exists {
+			// Replacing an outbound must not change whether the rule is enabled
+			// or its saved priority.
+			item.Rule.Disabled = current.Disabled
+			item.Rule.Priority = current.Priority
+			item.ExistingOutbound = current.Outbound
+			if current.Outbound == rule.Outbound {
+				item.Status = RoutingBatchDuplicate
+				item.Message = "当前规则中已存在"
+				preview.DuplicateCount++
+			} else {
+				item.Status = RoutingBatchConflict
+				item.Message = "当前规则已指向其他出口"
+				preview.ConflictCount++
+			}
+			preview.Items = append(preview.Items, item)
+			continue
+		}
+		item.Status = RoutingBatchAdd
+		preview.AddCount++
+		preview.Items = append(preview.Items, item)
+	}
+	return preview, nil
+}
+
+// Type order is stored even with no rules. Numeric priorities remain an internal
+// encoding for stable, hot-reloadable rule-set files and legacy backup readers.
+func routingMatchOrder(settings AppSettings) []string {
+	if validMatchOrder(settings.RoutingMatchOrder) {
+		return append([]string(nil), settings.RoutingMatchOrder...)
+	}
+	order := []string{MatchProcess, MatchDomain, MatchIP}
+	priority := map[string]int{}
+	for _, rule := range settings.RoutingRules {
+		if rule.Priority > priority[rule.MatchType] {
+			priority[rule.MatchType] = rule.Priority
+		}
+	}
+	sort.SliceStable(order, func(i, j int) bool { return priority[order[i]] > priority[order[j]] })
+	return order
+}
+
+func validMatchOrder(order []string) bool {
+	seen := map[string]bool{}
+	for _, kind := range order {
+		if (kind != MatchProcess && kind != MatchDomain && kind != MatchIP) || seen[kind] {
+			return false
+		}
+		seen[kind] = true
+	}
+	return len(order) == 3
+}
+
+func rulesWithMatchOrder(rules []RoutingRule, order []string) []RoutingRule {
+	result := append([]RoutingRule(nil), rules...)
+	for i := range result {
+		for rank, kind := range order {
+			if canonicalMatchType(result[i].MatchType) == kind {
+				result[i].Priority = 2 - rank
+			}
+		}
+	}
+	return result
+}
+
+var routingMutationMu sync.Mutex
+
+func routingRevision(settings AppSettings) string {
+	data, _ := json.Marshal(struct {
+		Rules []RoutingRule
+		Order []string
+	}{settings.RoutingRules, settings.RoutingMatchOrder})
+	return fmt.Sprintf("%x", sha256.Sum256(data))
+}
+
+// SaveOrderedChecked prevents a stale desktop draft from overwriting external AI edits.
+func (s *RoutingRuleService) SaveOrderedChecked(rules []RoutingRule, order []string, revision string) (RoutingSnapshot, error) {
+	routingMutationMu.Lock()
+	defer routingMutationMu.Unlock()
+	if revision == "" || routingRevision(s.settings.Get()) != revision {
+		return RoutingSnapshot{}, fmt.Errorf("规则已被其他操作更新；请重新载入并核对后保存，当前草稿未覆盖新规则")
+	}
+	return s.saveOrderedUnlocked(rules, order)
+}
+
+func (s *RoutingRuleService) SaveOrdered(rules []RoutingRule, order []string) (RoutingSnapshot, error) {
+	routingMutationMu.Lock()
+	defer routingMutationMu.Unlock()
+	return s.saveOrderedUnlocked(rules, order)
+}
+
+func (s *RoutingRuleService) saveOrderedUnlocked(rules []RoutingRule, order []string) (RoutingSnapshot, error) {
+	if !validMatchOrder(order) {
+		return RoutingSnapshot{}, fmt.Errorf("匹配顺序必须包含进程、域名、IP，且不能重复")
+	}
+	normalized, err := normalizeRulesStrict(rulesWithMatchOrder(rules, order))
+	if err != nil {
+		return RoutingSnapshot{}, err
+	}
+	if err := s.validateSelectedOutbounds(normalized); err != nil {
+		return RoutingSnapshot{}, err
+	}
+	if err := refreshSingBoxRuleSetsAndCommit(normalized, s.settings.Get().RuleSets, func() error {
+		s.settings.mu.Lock()
+		defer s.settings.mu.Unlock()
+		next := cloneSettings(s.settings.settings)
+		next.RoutingRules = normalized
+		next.RoutingMatchOrder = append([]string(nil), order...)
+		return s.settings.commitLocked(next)
+	}); err != nil {
+		return RoutingSnapshot{}, err
+	}
+	return s.Snapshot()
+}
+
+func (s *RoutingRuleService) Save(rules []RoutingRule) (RoutingSnapshot, error) {
+	routingMutationMu.Lock()
+	defer routingMutationMu.Unlock()
+	return s.saveUnlocked(rules)
+}
+
+func (s *RoutingRuleService) saveUnlocked(rules []RoutingRule) (RoutingSnapshot, error) {
+	if order := s.settings.Get().RoutingMatchOrder; validMatchOrder(order) {
+		return s.saveOrderedUnlocked(rules, order)
+	}
+	normalized, err := normalizeRulesStrict(rules)
+	if err != nil {
+		return RoutingSnapshot{}, err
+	}
+	if err := s.validateSelectedOutbounds(normalized); err != nil {
+		return RoutingSnapshot{}, err
+	}
+	if err := refreshSingBoxRuleSetsAndCommit(normalized, s.settings.Get().RuleSets, func() error {
+		return s.settings.saveRoutingRules(normalized)
+	}); err != nil {
+		return RoutingSnapshot{}, fmt.Errorf("保存分流规则失败；系统已尝试恢复原规则：%w", err)
+	}
+	return s.Snapshot()
+}
+
+func (s *RoutingRuleService) ListProcesses() ([]string, error) {
+	return listRunningProcesses()
+}
+
+func (s *RoutingRuleService) ListProcessChoices() ([]RunningProcess, error) {
+	return listRunningProcessChoices()
+}
+
+func (s *RoutingRuleService) Import() (RoutingSnapshot, error) {
+	path, err := s.desktop.OpenJSONFile("导入 Himix 分流规则")
+	if err != nil {
+		return RoutingSnapshot{}, fmt.Errorf("打开导入文件失败：%w", err)
+	}
+	if path == "" {
+		return s.Snapshot()
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return RoutingSnapshot{}, fmt.Errorf("读取规则文件失败：%w", err)
+	}
+	rules, err := parseRoutingBackup(data)
+	if err != nil {
+		return RoutingSnapshot{}, err
+	}
+	outbounds, err := s.availableOutbounds()
+	if err != nil {
+		return RoutingSnapshot{}, err
+	}
+	var envelope struct {
+		MatchOrder []string `json:"match_order"`
+	}
+	_ = json.Unmarshal(data, &envelope)
+	if len(envelope.MatchOrder) > 0 && !validMatchOrder(envelope.MatchOrder) {
+		return RoutingSnapshot{}, fmt.Errorf("备份匹配顺序无效")
+	}
+	order := routingMatchOrder(AppSettings{RoutingRules: rules, RoutingMatchOrder: envelope.MatchOrder})
+	return RoutingSnapshot{Rules: rules, Outbounds: outbounds, MatchOrder: order}, nil
+}
+
+func (s *RoutingRuleService) Export(rules []RoutingRule) (string, error) {
+	return s.ExportOrdered(rules, routingMatchOrder(s.settings.Get()))
+}
+
+func (s *RoutingRuleService) ExportOrdered(rules []RoutingRule, order []string) (string, error) {
+	if !validMatchOrder(order) {
+		return "", fmt.Errorf("匹配顺序无效")
+	}
+	rules = rulesWithMatchOrder(rules, order)
+	normalized, err := normalizeRulesStrict(rules)
+	if err != nil {
+		return "", err
+	}
+	path, err := s.desktop.SaveJSONFile("导出 Himix 分流规则", "himix-rules.json")
+	if err != nil {
+		return "", fmt.Errorf("打开导出位置失败：%w", err)
+	}
+	if path == "" {
+		return "", nil
+	}
+	if filepath.Ext(path) == "" {
+		path += ".json"
+	}
+	payload := struct {
+		Format     string        `json:"format"`
+		Version    int           `json:"version"`
+		MatchOrder []string      `json:"match_order"`
+		ExportedAt string        `json:"exported_at"`
+		Rules      []RoutingRule `json:"rules"`
+	}{RoutingBackupFormat, RoutingBackupVersion, order, time.Now().Format(time.RFC3339), normalized}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("生成规则备份失败：%w", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return "", fmt.Errorf("导出规则失败：%w", err)
+	}
+	return path, nil
+}
+
+func parseRoutingBackup(data []byte) ([]RoutingRule, error) {
+	var raw json.RawMessage = data
+	var envelope struct {
+		Format       string          `json:"format"`
+		Version      json.RawMessage `json:"version"`
+		Rules        json.RawMessage `json:"rules"`
+		RoutingRules json.RawMessage `json:"routing_rules"`
+	}
+	var rulesData json.RawMessage
+	if len(data) > 0 && data[0] == '[' {
+		rulesData = raw
+	} else if json.Unmarshal(data, &envelope) == nil {
+		if envelope.Format != "" && envelope.Format != RoutingBackupFormat {
+			return nil, fmt.Errorf("不支持的备份格式：%s", envelope.Format)
+		}
+		if envelope.Format == RoutingBackupFormat {
+			version := 0
+			if len(envelope.Version) > 0 {
+				_ = json.Unmarshal(envelope.Version, &version)
+				if version == 0 {
+					var text string
+					if json.Unmarshal(envelope.Version, &text) == nil {
+						version, _ = strconv.Atoi(text)
+					}
+				}
+			}
+			if version != 1 && version != 2 && version != RoutingBackupVersion {
+				return nil, fmt.Errorf("不支持的规则备份版本：%d", version)
+			}
+		}
+		rulesData = envelope.Rules
+		if len(rulesData) == 0 {
+			rulesData = envelope.RoutingRules
+		}
+	}
+	if len(rulesData) == 0 {
+		return nil, fmt.Errorf("规则文件必须包含 rules 数组")
+	}
+	return parseRoutingRulesJSON(rulesData)
+}
+
+func parseRoutingRulesJSON(data []byte) ([]RoutingRule, error) {
+	var entries []json.RawMessage
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, fmt.Errorf("规则必须是 JSON 数组：%w", err)
+	}
+	expanded := make([]RoutingRule, 0, len(entries))
+	for index, entry := range entries {
+		rules, err := expandRoutingRule(entry)
+		if err != nil {
+			return nil, fmt.Errorf("第 %d 条旧版规则无效：%w", index+1, err)
+		}
+		expanded = append(expanded, rules...)
+	}
+	return normalizeRulesStrict(expanded)
+}
+
+func normalizeRulesStrict(rules []RoutingRule) ([]RoutingRule, error) {
+	result := make([]RoutingRule, 0, len(rules))
+	seen := map[string]struct{}{}
+	for index, raw := range rules {
+		rule, err := normalizeRule(raw)
+		if err != nil {
+			return nil, fmt.Errorf("第 %d 条规则无效：%w", index+1, err)
+		}
+		identity := ruleIdentity(rule)
+		if _, duplicate := seen[identity]; duplicate {
+			continue
+		}
+		seen[identity] = struct{}{}
+		result = append(result, rule)
+	}
+	sortRules(result)
+	return result, nil
+}
+
+func normalizeRules(rules []RoutingRule) ([]RoutingRule, error) {
+	result := make([]RoutingRule, 0, len(rules))
+	seen := map[string]struct{}{}
+	for _, raw := range rules {
+		rule, err := normalizeRule(raw)
+		if err != nil {
+			continue
+		}
+		identity := ruleIdentity(rule)
+		if _, duplicate := seen[identity]; duplicate {
+			continue
+		}
+		seen[identity] = struct{}{}
+		result = append(result, rule)
+	}
+	sortRules(result)
+	return result, nil
+}
+
+func (s *RoutingRuleService) validateSelectedOutbounds(rules []RoutingRule) error {
+	adapters, err := s.adapters.List()
+	if err != nil {
+		return fmt.Errorf("读取可用网卡失败：%w", err)
+	}
+	return validateRoutingOutbounds(rules, adapters)
+}
+
+func availableRoutingOutbounds(adapters []AdapterView) map[string]struct{} {
+	available := map[string]struct{}{"aggregation": {}, "direct": {}, OutboundReject: {}}
+	for _, adapter := range adapters {
+		if adapter.Selected && adapter.Operational {
+			available["nic_"+adapter.ID] = struct{}{}
+		}
+	}
+	return available
+}
+
+func validateRoutingOutbounds(rules []RoutingRule, adapters []AdapterView) error {
+	available := availableRoutingOutbounds(adapters)
+	for index, rule := range rules {
+		if rule.Disabled {
+			continue
+		}
+		if _, ok := available[rule.Outbound]; !ok {
+			return fmt.Errorf("第 %d 条分流规则引用了未启用或不可用的网卡出口：%s", index+1, rule.Outbound)
+		}
+	}
+	return nil
+}
+
+func normalizeRule(rule RoutingRule) (RoutingRule, error) {
+	if rule.Priority < 0 || rule.Priority > 999 {
+		return RoutingRule{}, fmt.Errorf("优先级必须是 0–999 的整数")
+	}
+	rule.MatchType = canonicalMatchType(rule.MatchType)
+	rule.Outbound = strings.TrimSpace(rule.Outbound)
+	if rule.MatchType != MatchProcess && rule.MatchType != MatchDomain && rule.MatchType != MatchIP {
+		return RoutingRule{}, fmt.Errorf("未知匹配类型")
+	}
+	if !isValidOutbound(rule.Outbound) {
+		return RoutingRule{}, fmt.Errorf("未知出口通道")
+	}
+	value := strings.TrimSpace(rule.Value)
+	switch rule.MatchType {
+	case MatchProcess:
+		if value == "" || len(value) > 260 || strings.ContainsAny(value, "/\\:\x00") {
+			return RoutingRule{}, fmt.Errorf("进程名不能为空，且不能包含路径或冒号")
+		}
+	case MatchDomain:
+		value = strings.ToLower(strings.TrimSuffix(value, "."))
+		value = strings.TrimPrefix(strings.TrimPrefix(value, "*."), ".")
+		if value == "" || len(value) > 253 || strings.ContainsAny(value, "/\\:\x00?#@ ") || net.ParseIP(value) != nil {
+			return RoutingRule{}, fmt.Errorf("请输入有效域名，不要包含协议、端口或路径")
+		}
+		ascii, err := idna.Lookup.ToASCII(value)
+		if err != nil || len(ascii) > 253 {
+			return RoutingRule{}, fmt.Errorf("域名格式无效")
+		}
+		for _, label := range strings.Split(ascii, ".") {
+			if label == "" || len(label) > 63 || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+				return RoutingRule{}, fmt.Errorf("域名标签格式无效")
+			}
+		}
+		value = strings.ToLower(ascii)
+	case MatchIP:
+		if value == "" || len(value) > 64 {
+			return RoutingRule{}, fmt.Errorf("请输入有效 IP 或 CIDR")
+		}
+		if !strings.Contains(value, "/") {
+			ip := net.ParseIP(value)
+			if ip == nil {
+				return RoutingRule{}, fmt.Errorf("请输入有效 IP 或 CIDR")
+			}
+			if ip.To4() != nil {
+				value += "/32"
+			} else {
+				value += "/128"
+			}
+		}
+		ip, network, err := net.ParseCIDR(value)
+		if err != nil {
+			return RoutingRule{}, fmt.Errorf("请输入有效 IP 或 CIDR")
+		}
+		network.IP = ip.Mask(network.Mask)
+		value = network.String()
+	}
+	rule.Value = value
+	return rule, nil
+}
+
+func canonicalMatchType(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "process", "process_name":
+		return MatchProcess
+	case "domain", "domain_suffix":
+		return MatchDomain
+	case "ip", "ip_cidr":
+		return MatchIP
+	default:
+		return strings.ToLower(strings.TrimSpace(value))
+	}
+}
+
+func isValidOutbound(value string) bool {
+	return value == "aggregation" || value == "direct" || value == OutboundReject || value == "nic_ethernet" ||
+		value == "nic_wifi" || (strings.HasPrefix(value, "nic_") && len(value) > 4)
+}
+
+func ruleIdentity(rule RoutingRule) string {
+	return rule.MatchType + "\x00" + strings.ToLower(rule.Value)
+}
+
+func sortRules(rules []RoutingRule) {
+	candidates := manualRoutingCandidates(rules)
+	sortCandidates(candidates)
+	for index, candidate := range candidates {
+		rules[index] = candidate.rule
+	}
+}

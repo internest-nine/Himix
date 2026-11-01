@@ -1,0 +1,736 @@
+/* =====================================================================
+   Himix theme layer
+
+   Loaded after app.css and controls.css. Upstream shipped a left icon rail,
+   a Fluent card grid, and two competing mode cards in the hero. This layer
+   replaces the frame as well as the paint:
+
+     1. layout    — navigation moved from a 64px left rail to a bottom dock
+                    with written labels; the content pane is flat and full width
+     2. hierarchy — one primary action per screen instead of a wall of peers
+     3. surface   — larger radii, hairlines instead of borders, brand gradient
+                    only where the eye should land
+
+   Anything not mentioned here keeps upstream behaviour.
+   ===================================================================== */
+
+:root {
+  --himix-ink: #0d1117;
+  --himix-ok: #12a150;
+  --himix-warn: #d99a06;
+  --himix-danger: #e5484d;
+
+  --himix-radius-card: 20px;
+  --himix-radius-control: 14px;
+  --himix-radius-pill: 999px;
+
+  --himix-hairline: color-mix(in srgb, var(--hm-text-primary) 9%, transparent);
+  --himix-hairline-soft: color-mix(in srgb, var(--hm-text-primary) 6%, transparent);
+  --himix-brand-glow: color-mix(in srgb, var(--hm-accent) 44%, #4f46e5);
+}
+
+/* ---------------------------------------------------------------- palette */
+
+[data-appearance="light"] {
+  --hm-text-primary: #111827;
+  --hm-text-secondary: #4b5563;
+  --hm-text-tertiary: #7a8697;
+  --hm-window-base: #f5f7fa;
+  --hm-surface-rgb: 255, 255, 255;
+  --hm-surface-secondary-rgb: 246, 248, 251;
+  --hm-outer-border: rgba(17, 24, 39, 0.08);
+  --hm-shadow-colour: 17, 24, 39;
+  --hm-row-hover: rgba(17, 24, 39, 0.035);
+  --hm-system-background: linear-gradient(180deg, #fbfcfe 0%, #f3f5f9 100%);
+  --hm-selected-fill: color-mix(in srgb, var(--hm-accent) 7%, white);
+  --himix-dock-surface: rgba(255, 255, 255, 0.82);
+  --himix-dock-shadow: 0 18px 40px -18px rgba(17, 24, 39, 0.34);
+}
+
+[data-appearance="dark"] {
+  --hm-text-primary: #e8edf5;
+  --hm-text-secondary: #a5b0c0;
+  --hm-text-tertiary: #6d7889;
+  --hm-window-base: #0b0e13;
+  --hm-surface-rgb: 22, 26, 34;
+  --hm-surface-secondary-rgb: 17, 21, 28;
+  --hm-outer-border: rgba(255, 255, 255, 0.075);
+  --hm-shadow-colour: 0, 0, 0;
+  --hm-row-hover: rgba(255, 255, 255, 0.045);
+  --hm-system-background: linear-gradient(180deg, #0d1116 0%, #090b0f 100%);
+  --hm-selected-fill: color-mix(in srgb, var(--hm-accent) 16%, rgb(var(--hm-surface-rgb)));
+  --himix-dock-surface: rgba(20, 24, 32, 0.82);
+  --himix-dock-shadow: 0 20px 44px -18px rgba(0, 0, 0, 0.72);
+}
+
+/* ---------------------------------------------------------------- skeleton */
+
+/* Console layout: a permanent status rail on the left, one scrolling stage on
+   the right. Upstream was a top title bar over a single column. */
+/* One column: title bar, scrolling content, dock. Upstream was
+   `44px 1fr / 64px 1fr` with the rail pinned to column one. */
+.app-shell {
+  grid-template: 44px minmax(0, 1fr) auto / minmax(0, 1fr);
+}
+
+/* A single brand wash behind the content so the window reads as one surface
+   rather than a stack of panels. Absolute, so it does not take a grid cell. */
+.app-shell::before {
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 340px;
+  background: radial-gradient(
+    125% 100% at 10% -30%,
+    color-mix(in srgb, var(--hm-accent) 13%, transparent),
+    transparent 64%
+  );
+  pointer-events: none;
+  content: "";
+  /* Behind the shell's own content but above its background, so nothing in the
+     page needs a stacking context of its own. */
+  z-index: -1;
+}
+
+.page-viewport {
+  grid-row: 2;
+  grid-column: 1 / -1;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  background: transparent;
+}
+
+/* --------------------------------------------------------------- title bar */
+
+.titlebar {
+  border-bottom: 1px solid var(--himix-hairline-soft);
+  background: color-mix(in srgb, var(--hm-window-base) 82%, transparent);
+  backdrop-filter: blur(16px) saturate(130%);
+}
+
+/* The skip link used to clear a 64px left rail that no longer exists. */
+.skip-to-content {
+  left: 16px;
+}
+
+.titlebar-identity strong {
+  font-weight: 640;
+  letter-spacing: -0.015em;
+}
+
+.titlebar-identity > span:last-child {
+  color: var(--hm-text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* -------------------------------------------------------------------- dock */
+
+.dock {
+  position: relative;
+  z-index: 20;
+  display: flex;
+  grid-row: 3;
+  grid-column: 1 / -1;
+  justify-content: center;
+  padding: 6px 16px 14px;
+}
+
+.dock-bar {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 6px;
+  border: 1px solid var(--hm-outer-border);
+  border-radius: 22px;
+  background: var(--himix-dock-surface);
+  box-shadow: var(--himix-dock-shadow);
+  backdrop-filter: blur(26px) saturate(170%);
+}
+
+.dock-indicator {
+  position: absolute;
+  z-index: 0;
+  top: 6px;
+  bottom: 6px;
+  left: 0;
+  width: 0;
+  border-radius: 16px;
+  opacity: 0;
+  background: color-mix(in srgb, var(--hm-accent) 12%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--hm-accent) 16%, transparent);
+  pointer-events: none;
+  transition:
+    transform 340ms cubic-bezier(0.22, 1, 0.36, 1),
+    width 340ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity var(--hm-motion-fast) var(--hm-motion-ease-out);
+  will-change: transform, width;
+}
+
+.dock-indicator[data-visible="true"] {
+  opacity: 1;
+}
+
+.dock-item {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  min-width: 64px;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 6px 10px 5px;
+  border: 0;
+  border-radius: 16px;
+  background: transparent;
+  color: var(--hm-text-tertiary);
+  font: inherit;
+  cursor: pointer;
+  transition:
+    color var(--hm-motion-fast) var(--hm-motion-ease-out),
+    transform var(--hm-motion-fast) var(--hm-motion-ease-out);
+}
+
+.dock-item:hover {
+  color: var(--hm-text-primary);
+  background: transparent;
+}
+
+.dock-item:active {
+  transform: scale(0.95);
+}
+
+.dock-item:focus-visible {
+  outline: 2px solid var(--hm-focus-ring);
+  outline-offset: 2px;
+}
+
+.dock-item > .dock-item-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 20px;
+}
+
+.dock-item > .dock-item-icon > svg {
+  width: 20px;
+  height: 20px;
+}
+
+.dock-item-label {
+  font-size: 11px;
+  font-weight: 550;
+  line-height: 1.25;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+
+.dock-item.is-active {
+  color: color-mix(in srgb, var(--hm-accent) 88%, var(--hm-text-primary));
+}
+
+.dock-item.is-active .dock-item-label {
+  font-weight: 650;
+}
+
+.dock-item.is-active > .dock-item-icon > svg {
+  animation: nav-icon-in var(--hm-motion-normal) var(--hm-motion-ease-out) both;
+}
+
+.dock-item.is-quiet {
+  min-width: 56px;
+  color: var(--hm-text-tertiary);
+}
+
+.dock-divider {
+  width: 1px;
+  height: 26px;
+  margin: 0 6px;
+  background: var(--himix-hairline);
+}
+
+:is([data-motion="reduced"], [data-motion="off"]) .dock :is(.dock-item, .dock-indicator) {
+  transition: none !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  .dock :is(.dock-item, .dock-indicator) { transition: none !important; }
+}
+
+/* ------------------------------------------------------------------ pages */
+
+.page {
+  padding: calc(20px * var(--hm-density-space)) clamp(16px, 2.4vw, 32px);
+}
+
+.section-kicker {
+  color: var(--hm-text-tertiary);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.glass-surface {
+  border: 1px solid var(--hm-outer-border);
+  border-radius: var(--himix-radius-card);
+  box-shadow:
+    0 1px 2px rgba(var(--hm-shadow-colour), 0.04),
+    0 14px 34px -20px rgba(var(--hm-shadow-colour), 0.22);
+  backdrop-filter: none;
+}
+
+.glass-surface[data-tone="secondary"] {
+  box-shadow: 0 1px 2px rgba(var(--hm-shadow-colour), 0.035);
+}
+
+/* ------------------------------------------------------------- engine hero */
+
+/* Left column: title, one sentence, the primary action, then the optional
+   controls. Right column: live numbers only. */
+.engine-hero {
+  /* The card lives in an `auto` row normally, but the failover banner pushes it
+     into the `minmax(0, 1fr)` row while a link is down. Without a floor that
+     row can compress the card and `overflow: hidden` silently eats the start
+     button and the mode switch. 216px is upstream's own minimum. */
+  min-height: 216px;
+  padding: 22px 24px 20px;
+  grid-template-columns: minmax(0, 1fr) minmax(240px, 0.42fr);
+  gap: clamp(18px, 2.6vw, 40px);
+  align-items: start;
+  box-shadow:
+    0 1px 2px rgba(var(--hm-shadow-colour), 0.04),
+    0 22px 50px -30px rgba(var(--hm-shadow-colour), 0.32);
+}
+
+.engine-copy {
+  max-width: 640px;
+  gap: 0;
+}
+
+.engine-heading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+}
+
+/* The page's own title. Section headings below it step down, so the screen has
+   one obvious entry point instead of two competing h1-sized labels. */
+.engine-title {
+  font-size: 22px;
+  font-weight: 660;
+  letter-spacing: -0.026em;
+  line-height: 1.15;
+}
+
+.network-section-heading h1 {
+  font-size: 15px;
+  font-weight: 620;
+  letter-spacing: -0.01em;
+}
+
+.network-section-heading {
+  min-height: 0;
+  padding: 0 4px 10px;
+}
+
+.engine-state-badge {
+  border-radius: var(--himix-radius-pill);
+}
+
+.engine-lead {
+  margin: 6px 0 0;
+  color: var(--hm-text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* Primary action + mode switch share a row: the button leads, the switch sits
+   beside it as a secondary affordance rather than two equal-weight cards. */
+.engine-primary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 16px;
+}
+
+.engine-action {
+  display: inline-flex;
+  height: 38px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 20px;
+  border: 0;
+  border-radius: var(--himix-radius-pill);
+  background: var(--hm-accent);
+  color: #fff;
+  font: inherit;
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 6px 16px -8px color-mix(in srgb, var(--hm-accent) 80%, transparent);
+  transition: filter var(--hm-motion-fast) var(--hm-motion-ease-out), transform var(--hm-motion-fast) var(--hm-motion-ease-out);
+}
+
+.engine-action.engine-action-xl {
+  height: 46px;
+  padding: 0 28px;
+  background: linear-gradient(135deg, var(--hm-accent) 0%, var(--himix-brand-glow) 100%);
+  font-size: 15px;
+  font-weight: 620;
+  letter-spacing: -0.005em;
+  box-shadow:
+    0 10px 24px -12px color-mix(in srgb, var(--hm-accent) 78%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.22);
+}
+
+.engine-action.engine-action-xl > svg {
+  width: 18px;
+  height: 18px;
+}
+
+.engine-action:not(:disabled):hover {
+  filter: brightness(1.07);
+}
+
+.engine-action:not(:disabled):active {
+  transform: translateY(1px);
+}
+
+.engine-action:disabled {
+  background: color-mix(in srgb, var(--hm-text-primary) 11%, transparent);
+  color: var(--hm-text-tertiary);
+  box-shadow: none;
+  cursor: default;
+}
+
+.engine-action.is-stop {
+  background: color-mix(in srgb, var(--himix-danger) 92%, black);
+  box-shadow: 0 6px 16px -8px color-mix(in srgb, var(--himix-danger) 70%, transparent);
+}
+
+/* Segmented takeover switch. Two states, always both visible, no card weight. */
+.mode-segmented {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--himix-hairline-soft);
+  border-radius: var(--himix-radius-pill);
+  background: color-mix(in srgb, var(--hm-text-primary) 5%, transparent);
+}
+
+.mode-seg {
+  display: inline-flex;
+  height: 32px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: var(--himix-radius-pill);
+  background: transparent;
+  color: var(--hm-text-tertiary);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 550;
+  cursor: pointer;
+  transition:
+    color var(--hm-motion-fast) var(--hm-motion-ease-out),
+    background var(--hm-motion-fast) var(--hm-motion-ease-out),
+    box-shadow var(--hm-motion-fast) var(--hm-motion-ease-out);
+}
+
+.mode-seg > svg {
+  width: 16px;
+  height: 16px;
+}
+
+.mode-seg:not(:disabled):hover {
+  color: var(--hm-text-primary);
+}
+
+.mode-seg.is-active {
+  background: rgb(var(--hm-surface-rgb));
+  color: color-mix(in srgb, var(--hm-accent) 88%, var(--hm-text-primary));
+  box-shadow:
+    0 1px 2px rgba(var(--hm-shadow-colour), 0.12),
+    0 0 0 1px color-mix(in srgb, var(--hm-accent) 20%, transparent);
+}
+
+.mode-seg:disabled {
+  cursor: default;
+  opacity: 0.75;
+}
+
+.mode-seg:focus-visible {
+  outline: 2px solid var(--hm-focus-ring);
+  outline-offset: 1px;
+}
+
+/* Only the active mode is described: one sentence, inline, no second card. */
+.engine-mode-note {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 12px 0 0;
+  color: var(--hm-text-tertiary);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.engine-mode-note strong {
+  color: var(--hm-text-secondary);
+  font-weight: 620;
+}
+
+.engine-mode-sep {
+  opacity: 0.45;
+}
+
+.engine-mode-caution {
+  color: color-mix(in srgb, var(--himix-warn) 72%, var(--hm-text-secondary));
+}
+
+/* Optional settings live below a hairline so they never compete with Start. */
+.engine-secondary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  width: 100%;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--himix-hairline-soft);
+}
+
+.scheduling-selector {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.scheduling-label {
+  color: var(--hm-text-tertiary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.scheduling-dropdown {
+  min-width: 132px;
+}
+
+/* Inline now that it sits beside the dropdown, not under it. */
+.scheduling-hint {
+  margin: 0;
+  color: var(--hm-text-tertiary);
+  font-size: 11.5px;
+  line-height: 1.5;
+  max-width: 46ch;
+}
+
+/* No divider between the copy column and the live numbers. */
+.engine-hero .throughput-display,
+.engine-hero .throughput-display::before,
+.engine-hero .throughput-display::after {
+  border: 0;
+  border-left: 0;
+  box-shadow: none;
+}
+
+.throughput-value strong {
+  font-size: clamp(36px, 4vw, 50px);
+  font-weight: 600;
+  letter-spacing: -0.05em;
+}
+
+.throughput-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.throughput-meta {
+  gap: 18px;
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+/* The idle placeholder drew a grid and a rule; a single quiet line is enough. */
+.throughput-idle-grid {
+  display: none;
+}
+
+.throughput-idle > p {
+  margin: 0;
+  color: var(--hm-text-tertiary);
+  font-size: 12px;
+}
+
+/* ---------------------------------------------------------- adapter rows */
+
+.network-adapter {
+  min-height: 62px;
+  border: 0;
+  border-radius: 16px;
+  background: color-mix(in srgb, rgb(var(--hm-surface-rgb)) 58%, transparent);
+  box-shadow: none;
+}
+
+.network-adapter.is-selected,
+.network-adapter.is-muted {
+  background: color-mix(in srgb, rgb(var(--hm-surface-rgb)) 74%, transparent);
+}
+
+.network-adapter.is-selected {
+  background: color-mix(in srgb, var(--hm-accent) 5%, rgb(var(--hm-surface-rgb)));
+}
+
+.network-adapter:not(.is-selection-disabled):hover {
+  background: color-mix(in srgb, var(--hm-accent) 4%, rgb(var(--hm-surface-rgb)));
+}
+
+.health-badge {
+  border-radius: var(--himix-radius-pill);
+}
+
+/* --------------------------------------------------------------- footer bar */
+
+.runtime-status {
+  border: 0;
+  border-top: 1px solid var(--himix-hairline-soft);
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  padding: 10px 6px;
+}
+
+.runtime-icon {
+  color: var(--hm-text-tertiary);
+}
+
+.runtime-item small {
+  color: var(--hm-text-tertiary);
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.runtime-item strong {
+  font-size: 12.5px;
+  font-weight: 550;
+}
+
+/* ------------------------------------------------------------ routing page */
+
+.routing-normalized-hint {
+  margin: 8px 2px 0;
+  color: var(--hm-accent);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.routing-normalized-hint::before {
+  content: "→ ";
+  opacity: 0.75;
+}
+
+/* -------------------------------------------------------- narrow windows */
+
+/* Below ~720px the dock labels would wrap, so the bar scrolls horizontally
+   instead of cramping the items. */
+@media (max-width: 720px) {
+  .dock {
+    padding-inline: 8px;
+  }
+
+  .dock-bar {
+    max-width: 100%;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .dock-bar::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* --------------------------------------------------------------- scrollbar */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--hm-text-primary) 18%, transparent) transparent;
+}
+
+/* ------------------------------------------------------- link failover bar */
+
+/* One line that explains a line disappearing. It sits above the hero because it
+   changes how everything below should be read: the numbers are real, but they
+   are no longer produced by the adapters the user selected. */
+.link-failover-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+  padding: 9px 14px;
+  border-radius: var(--himix-radius-control);
+  border: 1px solid color-mix(in srgb, var(--himix-warn) 32%, transparent);
+  background: color-mix(in srgb, var(--himix-warn) 9%, rgb(var(--hm-surface-rgb)));
+  color: var(--hm-text-primary);
+}
+
+.link-failover-banner.is-recovering {
+  border-color: color-mix(in srgb, var(--himix-ok) 32%, transparent);
+  background: color-mix(in srgb, var(--himix-ok) 8%, rgb(var(--hm-surface-rgb)));
+}
+
+.link-failover-banner.is-offline {
+  border-color: color-mix(in srgb, var(--himix-danger) 34%, transparent);
+  background: color-mix(in srgb, var(--himix-danger) 8%, rgb(var(--hm-surface-rgb)));
+}
+
+.link-failover-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--himix-warn);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--himix-warn) 18%, transparent);
+}
+
+.link-failover-banner.is-recovering .link-failover-dot {
+  background: var(--himix-ok);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--himix-ok) 18%, transparent);
+}
+
+.link-failover-banner.is-offline .link-failover-dot {
+  background: var(--himix-danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--himix-danger) 18%, transparent);
+}
+
+.link-failover-text {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.link-failover-text strong {
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.link-failover-text span {
+  color: var(--hm-text-secondary);
+}
+
+.link-failover-note {
+  flex-basis: 100%;
+  font-size: 12px;
+  color: color-mix(in srgb, var(--himix-warn) 78%, var(--hm-text-secondary));
+}

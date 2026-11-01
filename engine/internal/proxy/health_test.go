@@ -1,0 +1,592 @@
+package proxy
+
+import (
+	"context"
+	"errors"
+	"net"
+	"os"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/internest-nine/Himix/engine/internal/dns"
+)
+
+func TestSharedHealthBackoffAndHalfOpenRecovery(t *testing.T) {
+	adapters := []Adapter{
+		{Name: "a", SourceIP: "127.0.0.1", Weight: 1},
+		{Name: "b", SourceIP: "127.0.0.2", Weight: 1},
+	}
+	now := time.Date(2026, 7, 30, 4, 0, 0, 0, time.UTC)
+	health := newHealthTable(adapters)
+	health.now = func() time.Time { return now }
+	proxyScheduler := newScheduler(adapters, false, health)
+	tunScheduler := newScheduler(adapters, false, health)
+
+	proxyScheduler.MarkFailure("a")
+	selected, ok := tunScheduler.Select(nil)
+	if !ok || selected.Name != "b" {
+		t.Fatalf("shared cooldown selected %#v, %v", selected, ok)
+	}
+	snapshot, _ := health.snapshot()
+	if snapshot["a"].State != "cooldown" ||
+		snapshot["a"].ConsecutiveFailures != 1 ||
+		snapshot["a"].CooldownUntil.Sub(now) != 2*time.Second {
+		t.Fatalf("first failure snapshot = %#v", snapshot["a"])
+	}
+
+	now = now.Add(2 * time.Second)
+	recoveryScheduler := newScheduler(adapters, false, health)
+	selected, ok = recoveryScheduler.Select(nil)
+	if !ok || selected.Name != "a" {
+		t.Fatalf("half-open recovery selected %#v, %v", selected, ok)
+	}
+	snapshot, _ = health.snapshot()
+	if snapshot["a"].State != "probing" {
+		t.Fatalf("expired cooldown state = %#v", snapshot["a"])
+	}
+
+	recoveryScheduler.MarkSuccess("a")
+	snapshot, _ = health.snapshot()
+	if snapshot["a"].State != "healthy" ||
+		snapshot["a"].ConsecutiveFailures != 0 ||
+		snapshot["a"].Successes != 1 {
+		t.Fatalf("recovered snapshot = %#v", snapshot["a"])
+	}
+}
+
+func TestLocalFailureBackoffIsBounded(t *testing.T) {
+	adapters := []Adapter{{Name: "a", SourceIP: "127.0.0.1"}}
+	now := time.Date(2026, 7, 30, 4, 0, 0, 0, time.UTC)
+	health := newHealthTable(adapters)
+	health.now = func() time.Time { return now }
+
+	for index, want := range []time.Duration{
+		2 * time.Second,
+		5 * time.Second,
+		15 * time.Second,
+		30 * time.Second,
+		30 * time.Second,
+	} {
+		health.recordLocalFailure("a")
+		snapshot, _ := health.snapshot()
+		if got := snapshot["a"].CooldownUntil.Sub(now); got != want {
+			t.Fatalf("failure %d backoff = %v, want %v", index+1, got, want)
+		}
+		now = now.Add(time.Second)
+	}
+}
+
+func TestDomainQuarantineRequiresComparativeEvidenceAndAvoidsOutage(t *testing.T) {
+	adapters := []Adapter{
+		{Name: "a", SourceIP: "127.0.0.1"},
+		{Name: "b", SourceIP: "127.0.0.2"},
+	}
+	now := time.Date(2026, 7, 30, 4, 0, 0, 0, time.UTC)
+	health := newHealthTable(adapters)
+	health.now = func() time.Time { return now }
+
+	health.recordComparativeDomainFailure("a", "Example.COM.")
+	scheduler := newScheduler(adapters, false, health)
+	selected, ok := scheduler.SelectForDomain(nil, "example.com")
+	if !ok || selected.Name != "a" {
+		t.Fatalf("single evidence unexpectedly isolated adapter: %#v", selected)
+	}
+
+	health.recordComparativeDomainFailure("a", "example.com")
+	scheduler = newScheduler(adapters, false, health)
+	selected, ok = scheduler.SelectForDomain(nil, "example.com")
+	if !ok || selected.Name != "b" {
+		t.Fatalf("quarantined selection = %#v, %v", selected, ok)
+	}
+	scheduler = newScheduler(adapters, false, health)
+	selected, _ = scheduler.SelectForDomain(nil, "other.example")
+	if selected.Name != "a" {
+		t.Fatalf("domain isolation leaked to another domain: %#v", selected)
+	}
+
+	health.recordComparativeDomainFailure("b", "example.com")
+	health.recordComparativeDomainFailure("b", "example.com")
+	scheduler = newScheduler(adapters, false, health)
+	if _, ok = scheduler.SelectForDomain(nil, "example.com"); !ok {
+		t.Fatal("all-domain quarantine caused a total outage")
+	}
+
+	_, quarantines := health.snapshot()
+	if len(quarantines) != 2 ||
+		quarantines[0].Domain != "example.com" ||
+		quarantines[0].ExpiresAt.Sub(now) != domainQuarantineTTL {
+		t.Fatalf("domain quarantine telemetry = %#v", quarantines)
+	}
+
+	now = now.Add(domainQuarantineTTL)
+	_, quarantines = health.snapshot()
+	if len(quarantines) != 0 {
+		t.Fatalf("expired quarantines = %#v", quarantines)
+	}
+}
+
+func TestDomainIsolationCanBeDisabled(t *testing.T) {
+	adapters := []Adapter{
+		{Name: "a", SourceIP: "127.0.0.1"},
+		{Name: "b", SourceIP: "127.0.0.2"},
+	}
+	health := newHealthTableConfigured(adapters, false, true, nil)
+	health.recordComparativeDomainFailure("a", "example.com")
+	health.recordComparativeDomainFailure("a", "example.com")
+
+	scheduler := newScheduler(adapters, false, health)
+	selected, ok := scheduler.SelectForDomain(nil, "example.com")
+	if !ok || selected.Name != "a" {
+		t.Fatalf("disabled domain isolation selected %#v, %v", selected, ok)
+	}
+	_, quarantines := health.snapshot()
+	if len(quarantines) != 0 {
+		t.Fatalf("disabled domain isolation retained quarantines: %#v", quarantines)
+	}
+}
+
+func TestDomainIsolationCanKeepQuarantineWithoutAutomaticExpiry(t *testing.T) {
+	adapters := []Adapter{{Name: "a", SourceIP: "127.0.0.1"}}
+	now := time.Date(2026, 7, 30, 4, 0, 0, 0, time.UTC)
+	health := newHealthTableConfigured(adapters, true, false, nil)
+	health.now = func() time.Time { return now }
+	health.recordComparativeDomainFailure("a", "example.com")
+	health.recordComparativeDomainFailure("a", "example.com")
+
+	_, quarantines := health.snapshot()
+	if len(quarantines) != 1 ||
+		!quarantines[0].ExpiresAt.Equal(now.AddDate(100, 0, 0)) {
+		t.Fatalf("permanent domain quarantine = %#v", quarantines)
+	}
+}
+
+func TestSuccessClearsOnlyMatchingDomainEvidence(t *testing.T) {
+	adapters := []Adapter{{Name: "a", SourceIP: "127.0.0.1"}}
+	health := newHealthTable(adapters)
+	health.recordComparativeDomainFailure("a", "one.example")
+	health.recordComparativeDomainFailure("a", "two.example")
+	health.recordSuccess("a", "one.example")
+
+	state := health.adapters["a"]
+	if _, exists := state.domains["one.example"]; exists {
+		t.Fatal("matching domain evidence remained after success")
+	}
+	if _, exists := state.domains["two.example"]; !exists {
+		t.Fatal("unrelated domain evidence was cleared")
+	}
+}
+
+func TestDomainEvidenceExpiresBeforeQuarantine(t *testing.T) {
+	adapters := []Adapter{{Name: "a", SourceIP: "127.0.0.1"}}
+	now := time.Date(2026, 7, 30, 4, 0, 0, 0, time.UTC)
+	health := newHealthTable(adapters)
+	health.now = func() time.Time { return now }
+
+	health.recordComparativeDomainFailure("a", "example.com")
+	now = now.Add(domainEvidenceTTL)
+	health.recordComparativeDomainFailure("a", "example.com")
+	entry := health.adapters["a"].domains["example.com"]
+	if entry == nil || entry.evidence != 1 {
+		t.Fatalf("stale evidence was retained: %#v", entry)
+	}
+}
+
+func TestDialLearnsDomainOnlyAfterAlternateAdapterSuccess(t *testing.T) {
+	adapters := []Adapter{
+		{Name: "a", SourceIP: "127.0.0.1"},
+		{Name: "b", SourceIP: "127.0.0.2"},
+	}
+	server, err := New(Config{
+		Adapters: adapters,
+		DNS: dns.Config{
+			Policy:        dns.PolicyOff,
+			LegacyServers: []string{"192.0.2.53"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := dns.New(context.Background(), server.config.DNS, func(
+		_ context.Context,
+		network string,
+		_ string,
+		_ dns.Binding,
+	) (net.Conn, error) {
+		client, dnsServer := net.Pipe()
+		go answerDNSAOnce(dnsServer, network, net.ParseIP("127.0.0.1").To4())
+		return client, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.resolver = resolver
+	dials := map[string]int{}
+	server.dialTCP = func(
+		_ context.Context,
+		dialer *net.Dialer,
+		_ string,
+	) (net.Conn, error) {
+		source := dialer.LocalAddr.(*net.TCPAddr).IP.String()
+		dials[source]++
+		if source == "127.0.0.1" {
+			return nil, syscall.Errno(10061)
+		}
+		client, peer := net.Pipe()
+		go peer.Close()
+		return client, nil
+	}
+
+	// Pool rotation continues after a fallback; only every other first attempt
+	// now uses a. Gather enough independent failures to reach the threshold.
+	for range 2*domainFailureThreshold - 1 {
+		connection, adapter, dialErr := server.dialUpstream(
+			context.Background(),
+			"Example.COM.:443",
+			server.scheduler,
+			false,
+			false,
+		)
+		if dialErr != nil {
+			t.Fatal(dialErr)
+		}
+		_ = connection.Close()
+		if adapter.Name != "b" {
+			t.Fatalf("alternate adapter = %q", adapter.Name)
+		}
+	}
+	_, quarantines := server.health.snapshot()
+	if len(quarantines) != 1 ||
+		quarantines[0].Adapter != "a" ||
+		quarantines[0].Domain != "example.com" {
+		t.Fatalf("learned quarantines = %#v", quarantines)
+	}
+	before := dials["127.0.0.1"]
+	connection, adapter, err := server.dialUpstream(
+		context.Background(),
+		"example.com:443",
+		server.scheduler,
+		false,
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = connection.Close()
+	if adapter.Name != "b" || dials["127.0.0.1"] != before {
+		t.Fatalf("quarantine was not applied: adapter=%q dials=%#v", adapter.Name, dials)
+	}
+	health, _ := server.health.snapshot()
+	if health["a"].Failures != 0 {
+		t.Fatalf("remote refusal poisoned global health: %#v", health["a"])
+	}
+}
+
+func TestDialDoesNotLearnDomainWhenEveryAdapterFails(t *testing.T) {
+	adapters := []Adapter{
+		{Name: "a", SourceIP: "127.0.0.1"},
+		{Name: "b", SourceIP: "127.0.0.2"},
+	}
+	server, err := New(Config{
+		Adapters: adapters,
+		DNS: dns.Config{
+			Policy:        dns.PolicyOff,
+			LegacyServers: []string{"192.0.2.53"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := dns.New(context.Background(), server.config.DNS, func(
+		_ context.Context,
+		network string,
+		_ string,
+		_ dns.Binding,
+	) (net.Conn, error) {
+		client, dnsServer := net.Pipe()
+		go answerDNSAOnce(dnsServer, network, net.ParseIP("127.0.0.1").To4())
+		return client, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.resolver = resolver
+	server.dialTCP = func(
+		context.Context,
+		*net.Dialer,
+		string,
+	) (net.Conn, error) {
+		return nil, syscall.Errno(10061)
+	}
+
+	for range 2 {
+		if _, _, err := server.dialUpstream(
+			context.Background(),
+			"outage.example:443",
+			server.scheduler,
+			false,
+			false,
+		); err == nil {
+			t.Fatal("all-adapter failure unexpectedly succeeded")
+		}
+	}
+	_, quarantines := server.health.snapshot()
+	if len(quarantines) != 0 {
+		t.Fatalf("all-adapter outage was learned: %#v", quarantines)
+	}
+}
+
+func TestDialCoolsDownAdapterThatOnlyTimesOut(t *testing.T) {
+	server, err := New(Config{Adapters: []Adapter{
+		{Name: "a", SourceIP: "127.0.0.1"},
+		{Name: "b", SourceIP: "127.0.0.2"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dials := map[string]int{}
+	server.dialTCP = func(_ context.Context, dialer *net.Dialer, _ string) (net.Conn, error) {
+		source := dialer.LocalAddr.(*net.TCPAddr).IP.String()
+		dials[source]++
+		if source == "127.0.0.1" {
+			// The address is still assigned, so no local errno is reported.
+			return nil, os.ErrDeadlineExceeded
+		}
+		client, peer := net.Pipe()
+		go peer.Close()
+		return client, nil
+	}
+
+	targets := []string{"192.0.2.10:443", "198.51.100.10:443", "203.0.113.10:443"}
+	for attempt := 0; ; attempt++ {
+		if health, _ := server.health.snapshot(); health["a"].State == "cooldown" {
+			break
+		}
+		if attempt > 4*adapterTimeoutFailureThreshold {
+			t.Fatalf("a was not cooled down: dials=%#v", dials)
+		}
+		target := targets[attempt%len(targets)]
+		connection, adapter, dialErr := server.dialUpstream(context.Background(), target, server.scheduler, true, false)
+		if dialErr != nil {
+			t.Fatal(dialErr)
+		}
+		_ = connection.Close()
+		if adapter.Name != "b" {
+			t.Fatalf("fallback adapter = %q", adapter.Name)
+		}
+	}
+	health, _ := server.health.snapshot()
+	if health["a"].State != "cooldown" || health["b"].State != "healthy" {
+		t.Fatalf("dead link was not cooled down: %#v", health)
+	}
+	before := dials["127.0.0.1"]
+	for range 3 {
+		connection, _, dialErr := server.dialUpstream(context.Background(), "192.0.2.10:443", server.scheduler, true, false)
+		if dialErr != nil {
+			t.Fatal(dialErr)
+		}
+		_ = connection.Close()
+	}
+	if dials["127.0.0.1"] != before {
+		t.Fatalf("cooling adapter still received new flows: %#v", dials)
+	}
+}
+
+func TestDialTimeoutsOnOneDestinationNetworkKeepHealth(t *testing.T) {
+	server, err := New(Config{Adapters: []Adapter{
+		{Name: "a", SourceIP: "127.0.0.1"},
+		{Name: "b", SourceIP: "127.0.0.2"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dials := 0
+	server.dialTCP = func(_ context.Context, dialer *net.Dialer, _ string) (net.Conn, error) {
+		if dialer.LocalAddr.(*net.TCPAddr).IP.String() == "127.0.0.1" {
+			dials++
+			// a cannot reach this range (blocked CDN, intranet behind b).
+			return nil, os.ErrDeadlineExceeded
+		}
+		client, peer := net.Pipe()
+		go peer.Close()
+		return client, nil
+	}
+	// Different hosts of one /24 still count as a single destination.
+	targets := []string{"192.0.2.10:443", "192.0.2.11:443", "192.0.2.12:443"}
+	for attempt := range 4 * adapterTimeoutFailureThreshold {
+		connection, _, dialErr := server.dialUpstream(context.Background(), targets[attempt%len(targets)], server.scheduler, true, false)
+		if dialErr != nil {
+			t.Fatal(dialErr)
+		}
+		_ = connection.Close()
+	}
+	if dials < adapterTimeoutFailureThreshold {
+		t.Fatalf("a was not tried enough: %d", dials)
+	}
+	health, _ := server.health.snapshot()
+	if health["a"].State != "healthy" {
+		t.Fatalf("one unreachable network cooled the whole link: %#v", health["a"])
+	}
+}
+
+func TestTimeoutTargetKeyGroupsNetworks(t *testing.T) {
+	for _, test := range []struct{ a, b string }{
+		{"192.0.2.10", "192.0.2.200"},
+		{"2001:db8:1:2::1", "2001:db8:1:ffff::9"},
+		{"Example.COM.", "example.com"},
+	} {
+		if timeoutTargetKey(test.a, net.ParseIP(test.a)) != timeoutTargetKey(test.b, net.ParseIP(test.b)) {
+			t.Fatalf("%s and %s should share a key", test.a, test.b)
+		}
+	}
+	for _, test := range []struct{ a, b string }{
+		{"192.0.2.10", "192.0.3.10"},
+		{"2001:db8:1::1", "2001:db8:2::1"},
+		{"a.example.com", "b.example.com"},
+	} {
+		if timeoutTargetKey(test.a, net.ParseIP(test.a)) == timeoutTargetKey(test.b, net.ParseIP(test.b)) {
+			t.Fatalf("%s and %s should not share a key", test.a, test.b)
+		}
+	}
+}
+
+func TestDialTimeoutOnEveryAdapterKeepsHealth(t *testing.T) {
+	server, err := New(Config{Adapters: []Adapter{
+		{Name: "a", SourceIP: "127.0.0.1"},
+		{Name: "b", SourceIP: "127.0.0.2"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.dialTCP = func(context.Context, *net.Dialer, string) (net.Conn, error) {
+		return nil, os.ErrDeadlineExceeded
+	}
+	for range 4 * adapterTimeoutFailureThreshold {
+		if _, _, err := server.dialUpstream(context.Background(), "192.0.2.10:443", server.scheduler, true, false); err == nil {
+			t.Fatal("unreachable destination unexpectedly succeeded")
+		}
+	}
+	health, _ := server.health.snapshot()
+	if health["a"].State != "healthy" || health["b"].State != "healthy" {
+		t.Fatalf("unreachable destination cooled adapters: %#v", health)
+	}
+}
+
+func TestComparativeTimeoutEvidenceResetsOnSuccess(t *testing.T) {
+	health := newHealthTable([]Adapter{{Name: "a", SourceIP: "127.0.0.1"}})
+	health.recordComparativeTimeout("a", "x")
+	health.recordComparativeTimeout("a", "y")
+	health.recordSuccess("a", "")
+	// The success also forgets x, so the evidence below covers only y, then z.
+	health.recordComparativeTimeout("a", "y")
+	health.recordComparativeTimeout("a", "y")
+	if snapshot, _ := health.snapshot(); snapshot["a"].State != "healthy" {
+		t.Fatalf("interleaved success did not reset evidence: %#v", snapshot["a"])
+	}
+	health.recordComparativeTimeout("a", "y")
+	if snapshot, _ := health.snapshot(); snapshot["a"].State != "healthy" {
+		t.Fatalf("one destination cooled down the link: %#v", snapshot["a"])
+	}
+	health.recordComparativeTimeout("a", "z")
+	if snapshot, _ := health.snapshot(); snapshot["a"].State != "cooldown" {
+		t.Fatalf("threshold did not cool down: %#v", snapshot["a"])
+	}
+}
+
+func TestServerSnapshotPublishesAdaptiveHealth(t *testing.T) {
+	server, err := New(Config{
+		Adapters: []Adapter{{Name: "a", SourceIP: "127.0.0.1"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.health.recordLocalFailure("a")
+	server.health.recordComparativeDomainFailure("a", "example.com")
+	server.health.recordComparativeDomainFailure("a", "example.com")
+
+	snapshot := server.Snapshot(false)
+	if len(snapshot.Adapters) != 1 {
+		t.Fatalf("adapter telemetry = %#v", snapshot.Adapters)
+	}
+	adapter := snapshot.Adapters[0]
+	if adapter.HealthState != "cooldown" ||
+		adapter.ConsecutiveFailures != 1 ||
+		adapter.HealthFailures != 1 ||
+		adapter.CooldownUntil == nil ||
+		adapter.DomainQuarantines != 1 {
+		t.Fatalf("adaptive health telemetry = %#v", adapter)
+	}
+	if len(snapshot.DomainQuarantines) != 1 ||
+		snapshot.DomainQuarantines[0].Adapter != "a" ||
+		snapshot.DomainQuarantines[0].Domain != "example.com" {
+		t.Fatalf("domain quarantine telemetry = %#v", snapshot.DomainQuarantines)
+	}
+}
+
+func TestLocalConnectFailureClassification(t *testing.T) {
+	if isLocalConnectFailure(nil) {
+		t.Fatal("absent failure was classified as local")
+	}
+	if isLocalConnectFailure(errors.New("plain failure")) {
+		t.Fatal("untyped failure was classified as local")
+	}
+	// Real dial failures arrive wrapped, so the unwrap path must keep working.
+	wrapped := &os.SyscallError{Syscall: "connect", Err: syscall.Errno(10061)}
+	if isLocalConnectFailure(wrapped) {
+		t.Fatal("remote connection refusal was classified as local")
+	}
+}
+
+func TestSharedHealthConcurrentSelectionAndTelemetry(t *testing.T) {
+	adapters := []Adapter{
+		{Name: "a", SourceIP: "127.0.0.1"},
+		{Name: "b", SourceIP: "127.0.0.2"},
+		{Name: "c", SourceIP: "127.0.0.3"},
+	}
+	health := newHealthTable(adapters)
+	schedulers := []*scheduler{
+		newScheduler(adapters, false, health),
+		newScheduler(adapters[:2], true, health),
+		newScheduler(adapters[1:], false, health),
+	}
+	var workers sync.WaitGroup
+	for worker := range 24 {
+		workers.Add(1)
+		go func(index int) {
+			defer workers.Done()
+			scheduler := schedulers[index%len(schedulers)]
+			for iteration := range 500 {
+				selected, ok := scheduler.SelectForDomain(
+					nil,
+					"Concurrent.Example.",
+				)
+				if !ok {
+					t.Errorf("worker %d found no adapter", index)
+					return
+				}
+				switch iteration % 4 {
+				case 0:
+					scheduler.MarkFailure(selected.Name)
+				case 1:
+					scheduler.MarkSuccess(
+						selected.Name,
+						"concurrent.example",
+					)
+				case 2:
+					health.recordComparativeDomainFailure(
+						selected.Name,
+						"concurrent.example",
+					)
+				default:
+					health.snapshot()
+				}
+			}
+		}(worker)
+	}
+	workers.Wait()
+	snapshot, _ := health.snapshot()
+	if len(snapshot) != len(adapters) {
+		t.Fatalf("health snapshot lost adapters: %#v", snapshot)
+	}
+}
