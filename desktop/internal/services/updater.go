@@ -34,6 +34,13 @@ const (
 	cnbLatestManifestURL     = cnbRepositoryURL + "/-/git/raw/update-channel/latest.json"
 	githubPreviewManifestURL = "https://raw.githubusercontent.com/internest-nine/Himix/update-channel-preview/latest.json"
 	cnbPreviewManifestURL    = cnbRepositoryURL + "/-/git/raw/update-channel-preview/latest.json"
+	// The raw CDN is unreachable from some networks (raw.githubusercontent.com
+	// resets the TLS handshake) while the REST API keeps answering. The git data
+	// API serves blob bytes verbatim, so the same signed manifest can be fetched
+	// through it without corrupting the binary signature.
+	githubAPIRepositoryURL   = "https://api.github.com/repos/internest-nine/Himix"
+	stableChannelRef         = "update-channel"
+	previewChannelRef        = "update-channel-preview"
 	updateManifestName       = "latest.json"
 	maxUpdateManifestSize    = 2 << 20
 	maxManifestSignatureSize = 1024
@@ -88,10 +95,12 @@ type UpdaterService struct {
 	launchInstaller     func(string, int) error
 	verifyInstaller     func(string) error
 	downloadIdleTimeout time.Duration
-	quit                func()
-	mu                  sync.RWMutex
-	progress            UpdateProgress
-	operationActive     bool
+	// Overridable so tests can point the API transport at a local server.
+	updateAPIBaseURL string
+	quit             func()
+	mu               sync.RWMutex
+	progress         UpdateProgress
+	operationActive  bool
 }
 
 func NewUpdaterService(quit ...func()) *UpdaterService {
@@ -101,6 +110,7 @@ func NewUpdaterService(quit ...func()) *UpdaterService {
 		launchInstaller:     launchInstallerAfterExit,
 		verifyInstaller:     verifyDownloadedInstallerAuthenticity,
 		downloadIdleTimeout: installerIdleTimeout,
+		updateAPIBaseURL:    githubAPIRepositoryURL,
 		progress:            UpdateProgress{State: "idle"},
 	}
 	if len(quit) > 0 {
@@ -151,23 +161,55 @@ func (s *UpdaterService) checkVersion(current, channel string) (UpdateCheckResul
 	defer cancel()
 
 	type metadataSource struct {
-		name  string
-		check func(context.Context) (ReleaseInfo, error)
+		name   string
+		stable bool
+		check  func(context.Context) (ReleaseInfo, error)
 	}
-	urls := []string{cnbLatestManifestURL, githubLatestManifestURL}
+	direct := func(manifestURL string, stable bool) metadataSource {
+		return metadataSource{
+			name:   manifestURL,
+			stable: stable,
+			check: func(ctx context.Context) (ReleaseInfo, error) {
+				return s.checkUpdateManifest(ctx, manifestURL)
+			},
+		}
+	}
+	throughAPI := func(ref string, stable bool) metadataSource {
+		return metadataSource{
+			name:   githubAPIRepositoryURL + "/git/trees/" + ref,
+			stable: stable,
+			check: func(ctx context.Context) (ReleaseInfo, error) {
+				return s.checkUpdateManifestThroughAPI(ctx, ref)
+			},
+		}
+	}
+	// Order only affects which error reads best; every source is queried in
+	// parallel and the highest version across them wins.
+	sources := []metadataSource{
+		throughAPI(stableChannelRef, true),
+		direct(cnbLatestManifestURL, true),
+		direct(githubLatestManifestURL, true),
+	}
 	if channel == "preview" {
-		urls = append(urls, cnbPreviewManifestURL, githubPreviewManifestURL)
+		sources = append(sources,
+			throughAPI(previewChannelRef, false),
+			direct(cnbPreviewManifestURL, false),
+			direct(githubPreviewManifestURL, false),
+		)
 	}
-	sources := make([]metadataSource, 0, len(urls))
-	for _, manifestURL := range urls {
-		sources = append(sources, metadataSource{name: manifestURL, check: func(ctx context.Context) (ReleaseInfo, error) {
-			release, err := s.checkUpdateManifest(ctx, manifestURL)
-			if err == nil && releaseversion.IsPrerelease(release.TagName) &&
-				(manifestURL == cnbLatestManifestURL || manifestURL == githubLatestManifestURL) {
+	// A stable channel must not hand out a prerelease, however it was fetched.
+	for i := range sources {
+		if !sources[i].stable {
+			continue
+		}
+		inner := sources[i].check
+		sources[i].check = func(ctx context.Context) (ReleaseInfo, error) {
+			release, err := inner(ctx)
+			if err == nil && releaseversion.IsPrerelease(release.TagName) {
 				return ReleaseInfo{}, errors.New("正式更新渠道包含预发布版本")
 			}
 			return release, err
-		}})
+		}
 	}
 	type sourceResult struct {
 		index   int
@@ -215,58 +257,114 @@ func (s *UpdaterService) checkUpdateManifest(ctx context.Context, manifestURL st
 	if err := validateUpdateMetadataURL(manifestURL); err != nil {
 		return ReleaseInfo{}, errors.New("更新 manifest 地址无效")
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, nil)
+	if err := validateUpdateMetadataURL(manifestURL + ".sig"); err != nil {
+		return ReleaseInfo{}, errors.New("更新 manifest 签名地址无效")
+	}
+	body, err := s.fetchUpdateBlob(ctx, manifestURL, "application/json", maxUpdateManifestSize,
+		"无法读取更新 manifest")
 	if err != nil {
 		return ReleaseInfo{}, err
 	}
-	request.Header.Set("Accept", "application/json")
+	signature, err := s.fetchUpdateBlob(ctx, manifestURL+".sig", "application/octet-stream",
+		maxManifestSignatureSize, "无法读取更新 manifest 签名")
+	if err != nil {
+		return ReleaseInfo{}, err
+	}
+	return s.verifySignedManifest(body, signature)
+}
+
+// Same signed manifest, delivered over the REST API instead of the raw CDN.
+// The signature is binary, and the contents endpoint re-encodes binary payloads
+// as text, so the blobs are read through the git data API, which returns bytes
+// untouched.
+func (s *UpdaterService) checkUpdateManifestThroughAPI(ctx context.Context, ref string) (ReleaseInfo, error) {
+	if ref != stableChannelRef && ref != previewChannelRef {
+		return ReleaseInfo{}, errors.New("更新通道名称无效")
+	}
+	rawTree, err := s.fetchUpdateBlob(
+		ctx,
+		s.updateAPIBaseURL+"/git/trees/"+url.PathEscape(ref),
+		"application/vnd.github+json",
+		maxUpdateManifestSize*8,
+		"无法读取更新通道目录",
+	)
+	if err != nil {
+		return ReleaseInfo{}, err
+	}
+	var tree struct {
+		Tree []struct {
+			Path string `json:"path"`
+			SHA  string `json:"sha"`
+		} `json:"tree"`
+	}
+	if err := json.Unmarshal(rawTree, &tree); err != nil {
+		return ReleaseInfo{}, errors.New("更新通道目录 JSON 无效")
+	}
+	shas := make(map[string]string, len(tree.Tree))
+	for _, entry := range tree.Tree {
+		shas[entry.Path] = entry.SHA
+	}
+	manifestSHA, ok := shas[updateManifestName]
+	if !ok {
+		return ReleaseInfo{}, errors.New("更新通道缺少 manifest")
+	}
+	signatureSHA, ok := shas[updateManifestName+".sig"]
+	if !ok {
+		return ReleaseInfo{}, errors.New("更新通道缺少 manifest 签名")
+	}
+	body, err := s.fetchUpdateBlob(ctx, s.updateAPIBaseURL+"/git/blobs/"+manifestSHA,
+		"application/vnd.github.raw", maxUpdateManifestSize, "无法读取更新 manifest")
+	if err != nil {
+		return ReleaseInfo{}, err
+	}
+	signature, err := s.fetchUpdateBlob(ctx, s.updateAPIBaseURL+"/git/blobs/"+signatureSHA,
+		"application/vnd.github.raw", maxManifestSignatureSize, "无法读取更新 manifest 签名")
+	if err != nil {
+		return ReleaseInfo{}, err
+	}
+	return s.verifySignedManifest(body, signature)
+}
+
+func (s *UpdaterService) fetchUpdateBlob(
+	ctx context.Context,
+	target string,
+	accept string,
+	limit int64,
+	failure string,
+) ([]byte, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Accept", accept)
 	request.Header.Set("User-Agent", "Himix-Updater")
 	response, err := s.client.Do(request)
 	if err != nil {
-		return ReleaseInfo{}, errors.New("无法读取更新 manifest")
+		return nil, errors.New(failure)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return ReleaseInfo{}, fmt.Errorf("更新 manifest HTTP %d", response.StatusCode)
+		return nil, fmt.Errorf("%s：HTTP %d", failure, response.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, maxUpdateManifestSize+1))
+	payload, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
 	if err != nil {
-		return ReleaseInfo{}, errors.New("读取更新 manifest 失败")
+		return nil, errors.New(failure)
 	}
-	if len(body) > maxUpdateManifestSize {
-		return ReleaseInfo{}, errors.New("更新 manifest 超过大小限制")
+	if int64(len(payload)) > limit {
+		return nil, errors.New(failure + "：内容超过大小限制")
 	}
-	signatureURL := manifestURL + ".sig"
-	if err := validateUpdateMetadataURL(signatureURL); err != nil {
-		return ReleaseInfo{}, errors.New("更新 manifest 签名地址无效")
+	if len(payload) == 0 {
+		return nil, errors.New(failure + "：内容为空")
 	}
-	signatureRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, signatureURL, nil)
-	if err != nil {
-		return ReleaseInfo{}, err
-	}
-	signatureRequest.Header.Set("Accept", "application/octet-stream")
-	signatureRequest.Header.Set("User-Agent", "Himix-Updater")
-	signatureResponse, err := s.client.Do(signatureRequest)
-	if err != nil {
-		return ReleaseInfo{}, errors.New("无法读取更新 manifest 签名")
-	}
-	defer signatureResponse.Body.Close()
-	if signatureResponse.StatusCode != http.StatusOK {
-		return ReleaseInfo{}, fmt.Errorf("更新 manifest 签名 HTTP %d", signatureResponse.StatusCode)
-	}
-	signature, err := io.ReadAll(io.LimitReader(signatureResponse.Body, maxManifestSignatureSize+1))
-	if err != nil {
-		return ReleaseInfo{}, errors.New("读取更新 manifest 签名失败")
-	}
-	if len(signature) > maxManifestSignatureSize {
-		return ReleaseInfo{}, errors.New("更新 manifest 签名超过大小限制")
-	}
+	return payload, nil
+}
+
+func (s *UpdaterService) verifySignedManifest(body []byte, signature []byte) (ReleaseInfo, error) {
 	if len(s.manifestPublicKey) != ed25519.PublicKeySize ||
 		len(signature) != ed25519.SignatureSize ||
 		!ed25519.Verify(s.manifestPublicKey, body, signature) {
 		return ReleaseInfo{}, errors.New("更新 manifest 的 Ed25519 签名无效")
 	}
-
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	var manifest updateManifest
