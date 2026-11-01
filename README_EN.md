@@ -18,7 +18,7 @@ Himix is an open-source multi-adapter aggregation and traffic-splitting tool for
 
 It distributes multi-connection downloads across several active adapters, so Ethernet, Wi-Fi, a phone hotspot or USB tethering can all carry traffic at the same time.
 
-**What sets it apart from upstream: fully offline, a rebuilt interface, less fiddly routing, and a bundled Windows installer.**
+**What sets it apart from upstream: quiet by default, a rebuilt interface, less fiddly routing, and a bundled Windows installer.**
 See [Differences from HypoMux](#differences-from-hypomux) below.
 
 > It aggregates many independent connections; it does not split a single TCP connection into several paths. That makes it a good fit for Steam, IDM, game-platform updaters and large browser downloads. A single-connection transfer is still limited by that connection's own link.
@@ -49,7 +49,7 @@ Grab either build from the [Releases](https://github.com/internest-nine/Himix/re
 - [Technical boundaries](#technical-boundaries)
 - [Building from source](#building-from-source)
 - [License](#license)
-- [Supporting this project](#supporting-this-project)
+- [On supporting this project](#on-supporting-this-project)
 
 ---
 
@@ -59,7 +59,7 @@ Upstream v2.8.2 ships a solid engine, and Himix **keeps every engine capability 
 
 | Area | HypoMux v2.8.2 | Himix 0.1 |
 | --- | --- | --- |
-| **Network behaviour** | Built-in AI assistant (configurable model API), MCP external tools, official update check | **All removed** — no outbound calls, no telemetry at runtime |
+| **Network behaviour** | Built-in AI assistant (configurable model API), MCP external tools, background update polling | **AI and MCP removed entirely**; updates are manual, with no startup check and no polling |
 | **Interface** | Left-hand icon rail (icons only, with tooltips) | **Single bottom pill navigation with labels**; the main area is left entirely to content |
 | **Mode naming** | "System proxy mode" / "Virtual NIC mode" | **"Light" and "Full"**, each stating what it does and what it costs |
 | **Rule input** | Pick the match type by hand; pasting a URL raises a format error | **Auto-detects** URL / IP / process, so you can paste directly |
@@ -67,11 +67,11 @@ Upstream v2.8.2 ships a solid engine, and Himix **keeps every engine capability 
 | **Link loss** | Rules pointing at a dropped adapter break with it | **Fails over** to a usable line and switches back silently once it returns |
 | **Installation** | Obtain an installer yourself | **Ships a NSIS installer**; installs and uninstalls cleanly |
 | **Installer signing** | SignPath signature (verifies a certificate chain online) | **Unsigned**, auditable |
-| **Updates** | In-app update check | **Replace the installer manually**; version managed by hand |
+| **Updates** | Automatic check on startup and on a timer | **Contacts the network only when you press "Check for updates"**; manifest verified with an Ed25519 signature |
 
 ### Each difference in one sentence
 
-**Fully offline.** Upstream's AI assistant can talk to any model API, and MCP can expose data to external AI clients; the update check polls an official update channel. Himix **deletes** all of it rather than hiding it behind a switch — 37 frontend files (248 KB of components) and 15 backend files (3,687 lines) removed outright, with zero provider domains left. The `pixi.js` and `pixi-live2d-display` Live2D dependency declarations are gone too: upstream used them to render the assistant's avatar, and nothing here references them. The `pixi`, `cubism4`, `display` and `AIAssistant` chunks no longer exist in the bundle. The trade-off is that you manage versions yourself; the benefit is that **not a single byte leaves your machine at runtime**.
+**Quiet by default.** Upstream's AI assistant can talk to any model API, and MCP can expose data to external AI clients; the update check runs at startup and on a timer against an official channel. Himix **deletes** the AI and MCP layers outright rather than hiding them behind a switch — 37 frontend files (248 KB of components) and 15 backend files (3,687 lines) removed outright, with zero provider domains left. The `pixi.js` and `pixi-live2d-display` Live2D dependency declarations are gone too: upstream used them to render the assistant's avatar, and nothing here references them. The `pixi`, `cubism4`, `display` and `AIAssistant` chunks no longer exist in the bundle. Updates became **a single request, only when you press the button**. The benefit is that **an idle Himix sends nothing at all**.
 
 > Upstream's `updater.go` (738 lines) is **kept but never registered** in this fork — no production code path calls it, so the update check does not exist in practice. It is retained so the release pipeline can validate the installer naming contract (`Himix_Setup_<version>.exe`), and tests still cover its logic.
 
@@ -309,11 +309,15 @@ Upstream's sponsors, signing service and acknowledgements are listed in the upst
 
 ---
 
-## Supporting this project
+## On supporting this project
 
-Himix is free — no paid tier, no feature locks, no ads. It works the same whether or not you ever contribute.
+Himix is free: no paid tier, no feature locks.
 
-If it did saturate your bandwidth, or saved you from hand-tuning routing rules, you can buy me a coffee with the codes below. Entirely optional.
+What it costs is mostly time — tracking changes in Windows and in Wintun/WFP, verifying install and upgrade paths on real hardware, and working through reports. If this tool saved you some of that, and you would like to put something toward it, the codes are below. Any amount; or none at all, with nothing changing either way.
+
+Worth saying plainly: the engine and most of the features come from upstream HypoMux. This repository reworks and polishes the product layer, nothing more.
+
+Feedback helps more than money — an [issue](https://github.com/internest-nine/Himix/issues) carrying the diagnostics from the About page saves us both a round of guessing.
 
 <table align="center">
   <tr>
@@ -326,4 +330,4 @@ If it did saturate your bandwidth, or saved you from hand-tuning routing rules, 
   </tr>
 </table>
 
-> Both codes are for Chinese payment apps; they may need a mainland account. If you would rather help in a way that costs nothing, filing an [issue](https://github.com/internest-nine/Himix/issues) is far more useful.
+> Both codes are for Chinese payment apps (WeChat Pay and Alipay), so they may need a mainland account.

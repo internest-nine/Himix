@@ -219,8 +219,8 @@ export function AboutPage() {
           </p>
           <p>
             {text(
-              "如果你愿意支持这个项目，请优先支持上游作者：https://github.com/Hypostasis-Cat/HypoMux",
-              "If you would like to support this work, please support the upstream author first: https://github.com/Hypostasis-Cat/HypoMux",
+              "如果你想支持这个项目，项目主页的「关于支持」一节里有说明。",
+              "If you would like to support this project, the \"On supporting this project\" section on the project page explains the options.",
             )}
           </p>
         </GlassSurface>
