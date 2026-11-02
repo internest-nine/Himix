@@ -69,3 +69,16 @@ it("checks for updates only after the user presses the button", async () => {
   await waitFor(() => expect(checkMock).toHaveBeenCalledTimes(1));
   await waitFor(() => expect(screen.getByText(/latest version/i)).toBeTruthy());
 });
+
+// The tip codes are plain files under public/support and get embedded into the
+// binary at build time. Renaming one, or forgetting to copy it in, renders two
+// broken images with no error anywhere - so pin both paths.
+it("shows both tip codes from public/support", () => {
+  render(<AboutPage />);
+  expect(screen.getByRole("img", { name: /wechat tip code/i }).getAttribute("src")).toBe(
+    "/support/qr-wechat.png",
+  );
+  expect(screen.getByRole("img", { name: /alipay tip code/i }).getAttribute("src")).toBe(
+    "/support/qr-alipay.png",
+  );
+});

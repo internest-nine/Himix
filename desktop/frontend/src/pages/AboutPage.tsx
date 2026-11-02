@@ -210,17 +210,33 @@ export function AboutPage() {
         </GlassSurface>
 
         <GlassSurface className="sponsor-section">
-          <h2>{text("关于上游项目", "About the upstream project")}</h2>
+          <h2>{text("关于支持", "On supporting this project")}</h2>
           <p>
             {text(
-              "Himix 的引擎与绝大部分功能来自 HypoMux（作者 Hypostasis-Cat）。本仓库只做产品层的二次开发，上游的绝大部分工作不属于本分支作者。",
-              "Himix's engine and the vast majority of its features come from HypoMux, by Hypostasis-Cat. This repository only reworks the product layer; the bulk of the work is upstream's, not the fork author's.",
+              "Himix 免费，没有付费版，也不会做功能限制。维护它花的主要是时间——跟进 Windows 与 Wintun/WFP 的行为变化、在真机上验证安装和升级路径、处理反馈。",
+              "Himix is free: no paid tier, no feature locks. What it costs is mostly time — tracking changes in Windows and in Wintun/WFP, verifying install and upgrade paths on real hardware, and working through reports.",
             )}
           </p>
           <p>
             {text(
-              "如果你想支持这份工作，请优先支持上游作者（Hypostasis-Cat）。本分支自己的说明见项目主页的「关于支持」一节。",
-              "If you would like to support this work, please support the upstream author (Hypostasis-Cat) first. This fork's own notes are in the \"On supporting this project\" section on the project page.",
+              "如果它替你省下了一些折腾，而你愿意为这些时间付一点费用，可以扫下面的码。金额随意；不扫也一样，功能上没有任何区别。",
+              "If this tool saved you some of that, and you would like to put something toward it, the codes are below. Any amount; or none at all, with nothing changing either way.",
+            )}
+          </p>
+          <div className="payment-grid">
+            <figure className="payment-item hm-card">
+              <figcaption>{text("微信", "WeChat")}</figcaption>
+              <Image src="/support/qr-wechat.png" alt={text("微信赞赏码", "WeChat tip code")} />
+            </figure>
+            <figure className="payment-item hm-card">
+              <figcaption>{text("支付宝", "Alipay")}</figcaption>
+              <Image src="/support/qr-alipay.png" alt={text("支付宝赞赏码", "Alipay tip code")} />
+            </figure>
+          </div>
+          <p>
+            {text(
+              "需要说清楚的是：引擎和绝大部分功能来自上游 HypoMux（作者 Hypostasis-Cat），这个仓库只做产品层的改造与打磨。",
+              "Worth saying plainly: the engine and most of the features come from upstream HypoMux, by Hypostasis-Cat. This repository only reworks and polishes the product layer.",
             )}
           </p>
         </GlassSurface>
