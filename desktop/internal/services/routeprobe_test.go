@@ -8,8 +8,8 @@ import (
 func TestRouteProbeHostNormalisesPastableInput(t *testing.T) {
 	cases := []struct{ input, want string }{
 		{"portal.example.com", "portal.example.com"},
-		{"https://portal.example.com/SitePages/home.aspx", "portal.example.com"},
-		{"http://203.0.113.8:8081/portal/app/mockapp/login.jsp?trid=1", "203.0.113.8"},
+		{"https://portal.example.com/pages/home.aspx", "portal.example.com"},
+		{"http://203.0.113.8:8081/portal/login.jsp?trid=1", "203.0.113.8"},
 		{"https://www.example.com/item/123?id=5", "www.example.com"},
 		{"  HTTPS://Example.COM:8443/path  ", "example.com"},
 		{"example.com.", "example.com"},

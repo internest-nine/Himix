@@ -107,7 +107,7 @@ describe("detectMatchKind", () => {
 
   it("routes a URL pointing at a bare address to the IP tab", () => {
     // The value that produced the HM-E1301 error in the process tab.
-    expect(detectMatchKind("http://203.0.113.8:8081/portal/app/mockapp/login.jsp?fid=1")).toBe("ip");
+    expect(detectMatchKind("http://203.0.113.8:8081/portal/login.jsp?fid=1")).toBe("ip");
     expect(detectMatchKind("192.168.1.1")).toBe("ip");
     expect(detectMatchKind("10.0.0.0/8")).toBe("ip");
   });

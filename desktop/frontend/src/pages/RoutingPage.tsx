@@ -539,7 +539,7 @@ export function RoutingPage() {
       notify(
         text("识别不出要匹配的内容", "Could not read that value"),
         effectiveType === "domain"
-          ? text("请填域名或直接粘贴网址，例如 https://www.example.com/page", "Enter a domain or paste a URL, e.g. https://www.example.com/page")
+          ? text("请填域名，或直接粘贴一个网址", "Enter a domain, or paste a URL")
           : effectiveType === "ip"
             ? text("请填 IP 地址或网段，例如 203.0.113.8 或 203.0.113.0/24", "Enter an IP address or subnet, e.g. 203.0.113.8 or 203.0.113.0/24")
             : text("程序名只写名字就行，例如 chrome.exe，不要带路径或冒号", "Use just the executable name, e.g. chrome.exe — no path or colon"),
