@@ -110,10 +110,11 @@ func restoreProxySnapshot(key proxyRegistryKey, snapshot proxySnapshot, actions 
 	if snapshot.HasProxyEnable {
 		err = key.SetDWordValue("ProxyEnable", uint32(snapshot.ProxyEnable))
 	} else {
-		err = key.DeleteValue("ProxyEnable")
-		if errors.Is(err, registry.ErrNotExist) {
-			err = nil
-		}
+		// Never delete ProxyEnable. WinINET reads a missing value as "keep what
+		// you have cached", so the next settings-changed notification writes the
+		// previous proxy back and undoes the restore. Writing 0 means the same
+		// thing to WinINET as "no proxy" and survives the notification.
+		err = key.SetDWordValue("ProxyEnable", 0)
 	}
 	if err != nil {
 		return "", fmt.Errorf("恢复代理开关失败：%w", err)

@@ -52,6 +52,11 @@ func enableSystemProxy(httpPort int, socksPort int) error {
 	if err != nil {
 		return fmt.Errorf("读取原系统代理设置失败：%w", err)
 	}
+	// A previous run may have left our own proxy address behind. Those leftovers
+	// are not the user's settings, so the snapshot must not record them as the
+	// original state - otherwise every restore puts them back and the machine
+	// never returns to how it was.
+	discardOwnProxyLeftovers(&original)
 	serverValue := fmt.Sprintf("http=127.0.0.1:%d;https=127.0.0.1:%d;socks=127.0.0.1:%d", httpPort, httpPort, socksPort)
 	snapshot := proxySnapshot{
 		Version: 2, State: "prepared", OwnedServer: serverValue, OwnedOverride: systemProxyBypass,
@@ -136,6 +141,22 @@ func saveProxySnapshot(snapshot proxySnapshot) error {
 }
 
 var hypoMuxProxyServerPattern = regexp.MustCompile(`^http=127\.0\.0\.1:[0-9]{1,5};https=127\.0\.0\.1:[0-9]{1,5};socks=127\.0\.0\.1:[0-9]{1,5}$`)
+
+// discardOwnProxyLeftovers drops values that only Himix could have written.
+// The proxy address is ours whenever it matches the exact form we install, and
+// the bypass list is ours whenever it is byte-identical to the one we write.
+// Anything else belongs to the user and stays in the snapshot.
+func discardOwnProxyLeftovers(original *proxyRegistryValues) {
+	if !original.HasServer || !hypoMuxProxyServerPattern.MatchString(original.Server) {
+		return
+	}
+	original.HasServer = false
+	original.Server = ""
+	if original.HasOverride && (original.Override == systemProxyBypass || original.Override == legacySystemProxyBypass) {
+		original.HasOverride = false
+		original.Override = ""
+	}
+}
 
 func recoverCorruptProxyMarker(parseErr error) (string, error) {
 	corruptPath := fmt.Sprintf("%s.corrupt-%d", proxyMarkerPath(), time.Now().Unix())

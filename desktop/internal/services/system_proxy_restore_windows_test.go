@@ -18,6 +18,7 @@ type fakeProxyRegistry struct {
 	failAt  string
 	readErr error
 	writes  int
+	deleted []string
 }
 
 func (k *fakeProxyRegistry) GetIntegerValue(string) (uint64, uint32, error) {
@@ -71,6 +72,7 @@ func (k *fakeProxyRegistry) DeleteValue(name string) error {
 	if err := k.write(name); err != nil {
 		return err
 	}
+	k.deleted = append(k.deleted, name)
 	switch name {
 	case "ProxyEnable":
 		k.values.HasEnable, k.values.Enable = false, 0
@@ -241,8 +243,14 @@ func TestProxyRestoreMissingOriginalValuesAndReadFailure(t *testing.T) {
 	if _, err := restoreProxySnapshot(key, snapshot, actions); err != nil {
 		t.Fatal(err)
 	}
-	if key.values != (proxyRegistryValues{}) {
-		t.Fatalf("missing original values not deleted: %+v", key.values)
+	// ProxyServer and ProxyOverride are removed because they were absent before.
+	// ProxyEnable is written as 0 instead of being removed: WinINET reads a
+	// missing value as "keep the cached configuration" and puts the old proxy
+	// back on the next settings-changed notification, which would undo the
+	// restore entirely.
+	want := proxyRegistryValues{HasEnable: true, Enable: 0}
+	if key.values != want {
+		t.Fatalf("missing original values not restored: got %+v want %+v", key.values, want)
 	}
 }
 
@@ -262,5 +270,67 @@ func TestSystemProxyBypassMatchesOnlyIntended172PrivateRange(t *testing.T) {
 		if matched != test.want {
 			t.Errorf("bypass %s = %t", test.address, matched)
 		}
+	}
+}
+
+// Deleting ProxyEnable is what made the restore a no-op on a real machine.
+// WinINET reads a missing value as "keep the cached configuration", so the
+// settings-changed notification right after the restore wrote the previous
+// proxy back. Writing 0 says the same thing to WinINET and survives it.
+func TestProxyRestoreNeverDeletesProxyEnable(t *testing.T) {
+	key, snapshot, actions := proxyRecoveryTestFixture(t)
+	snapshot.HasProxyEnable = false
+	snapshot.ProxyEnable = 0
+	snapshot.HasProxyServer = false
+	snapshot.ProxyServer = ""
+	snapshot.HasProxyOverride = false
+	snapshot.ProxyOverride = ""
+
+	if _, err := restoreProxySnapshot(key, snapshot, actions); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range key.deleted {
+		if name == "ProxyEnable" {
+			t.Fatal("ProxyEnable was deleted; WinINET would restore the cached proxy")
+		}
+	}
+	if !key.values.HasEnable || key.values.Enable != 0 {
+		t.Fatalf("ProxyEnable = %+v, want present and 0", key.values)
+	}
+}
+
+// A proxy address in our own format can only have been written by Himix, so it
+// is a leftover rather than the user's setting. Recording it as the original
+// state would put it back on every restore and the machine would never return
+// to how it was.
+func TestProxyLeftoversFromHimixAreNotTreatedAsUserSettings(t *testing.T) {
+	own := "http=127.0.0.1:10801;https=127.0.0.1:10801;socks=127.0.0.1:10800"
+	original := proxyRegistryValues{
+		HasEnable: true, Enable: 0,
+		HasServer: true, Server: own,
+		HasOverride: true, Override: systemProxyBypass,
+	}
+	discardOwnProxyLeftovers(&original)
+	if original.HasServer || original.Server != "" {
+		t.Fatalf("own proxy address kept as original: %+v", original)
+	}
+	if original.HasOverride || original.Override != "" {
+		t.Fatalf("own bypass list kept as original: %+v", original)
+	}
+}
+
+// A proxy the user configured themselves must survive untouched.
+func TestUserProxyIsKeptAsOriginal(t *testing.T) {
+	original := proxyRegistryValues{
+		HasEnable: true, Enable: 1,
+		HasServer: true, Server: "http=192.168.1.9:8888",
+		HasOverride: true, Override: "corp.local;<local>",
+	}
+	discardOwnProxyLeftovers(&original)
+	if !original.HasServer || original.Server != "http=192.168.1.9:8888" {
+		t.Fatalf("user proxy discarded: %+v", original)
+	}
+	if !original.HasOverride || original.Override != "corp.local;<local>" {
+		t.Fatalf("user bypass list discarded: %+v", original)
 	}
 }
